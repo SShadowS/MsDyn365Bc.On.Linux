@@ -665,6 +665,40 @@ else
     log_step "Cleared test framework global entries (will re-publish via dev endpoint)"
 fi
 
+# =============================================================================
+# Precompiled-app snapshot restore (no-recompile publish).
+#
+# BC_RESTORE_SNAPSHOT=<name>: restore a previously-captured app snapshot
+# (scripts/management-publish.py snapshot) into CRONUS before NST starts. The
+# snapshot carries the apps' Published Application / Installed Application /
+# NAV App Installed App rows AND their already-compiled Application Object
+# Metadata blobs, so NST activates the apps WITHOUT recompiling them from AL
+# source — the equivalent of Publish-NAVApp for precompiled binaries. This is
+# how Microsoft's stock app chain (System Application -> Business Foundation ->
+# Base Application) gets deployed on Linux, where the dev endpoint's recompile
+# fails (AL0327 missing resources / AL1024 missing symbols). See
+# MANAGEMENT-PUBLISH.md. Default unset = no effect.
+#
+# Runs AFTER the clear block on purpose: a typical flow is
+# BC_CLEAR_ALL_APPS=system-only (clear everything to the System app) +
+# BC_RESTORE_SNAPSHOT=<chain> (re-add the precompiled chain).
+if [ -n "${BC_RESTORE_SNAPSHOT:-}" ]; then
+    SNAP_BAK="${BC_RESTORE_SNAPSHOT}"
+    case "$SNAP_BAK" in
+        */*) : ;;                                    # explicit path
+        *)   SNAP_BAK="/bc/app-snapshots/${SNAP_BAK}.bak" ;;
+    esac
+    if [ -f "$SNAP_BAK" ]; then
+        log_step "BC_RESTORE_SNAPSHOT: restoring precompiled app snapshot $SNAP_BAK (no recompile)"
+        SQL_SERVER="$SQL_SERVER" BC_DB_USER="$BC_DB_USER" BC_DB_PASSWORD="$BC_DB_PASSWORD" \
+            BC_DB_NAME="CRONUS" SQLCMD_TLS="$SQLCMD_TLS" \
+            python3 /bc/scripts/management-publish.py restore --bak "$SNAP_BAK" 2>&1 \
+            | sed 's/^/[entrypoint]   /' || log_step "WARN: snapshot restore failed"
+    else
+        log_step "WARN: BC_RESTORE_SNAPSHOT=$BC_RESTORE_SNAPSHOT not found at $SNAP_BAK — skipping"
+    fi
+fi
+
 # Service user for scripting/OData/dev endpoint (password hash for Admin123! with GUID 00000000-0000-0000-0000-000000000001)
 # Named BCRUNNER (not ADMIN) so tests can freely create/delete/disable an "ADMIN" user.
 USER_GUID='00000000-0000-0000-0000-000000000001'

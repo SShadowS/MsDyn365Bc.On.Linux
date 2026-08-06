@@ -81,7 +81,12 @@ services:
       # .NET runtime tuning. Defaults are inherited from the entrypoint
       # (gcServer=1, TieredCompilation=0). These pass-throughs let us A/B
       # test additional knobs without rebuilding the image.
-      DOTNET_TieredCompilation: ${DOTNET_TieredCompilation:-}
+      #
+      # tc1-validation branch ONLY: default flipped to 1 to validate
+      # TieredCompilation=1 across the full CI test matrix (JMP hooks
+      # under real test load, not just a plain boot). Do not merge this
+      # default change to master without a green run + BCApps gate.
+      DOTNET_TieredCompilation: ${DOTNET_TieredCompilation:-1}
       DOTNET_TC_QuickJitForLoops: ${DOTNET_TC_QuickJitForLoops:-}
       DOTNET_ReadyToRun: ${DOTNET_ReadyToRun:-}
       DOTNET_GCRetainVM: ${DOTNET_GCRetainVM:-}

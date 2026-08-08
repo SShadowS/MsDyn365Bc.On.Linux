@@ -31,10 +31,11 @@ name: Probe CRIU checkpoint/restore (diagnostic)
 # changes and not on unrelated pushes — test-versions.yml already demonstrated
 # what an unfiltered trigger costs in this repo. Delete this `push:` block once
 # the probe has told you what you need; it is scaffolding, not a fixture.
+# The push trigger has been REMOVED: the probe answered what a hosted runner can
+# answer (criu dumps BC fine; docker's restore cannot rebuild the netns — see
+# PERFORMANCE-IDEAS.md). Dispatch it deliberately if you resume on podman or a
+# self-hosted box.
 on:
-  push:
-    branches: [claude/hosted-runner-performance-42ljw4]
-    paths: ['.github/workflows/probe-criu.yml']
   workflow_dispatch:
     inputs:
       bc_version:

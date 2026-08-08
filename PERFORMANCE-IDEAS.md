@@ -146,7 +146,59 @@ fresh SQL container remains the hard, untested case. And a hosted runner is
 ephemeral, so none of this measures the win — that only exists where the
 checkpoint survives between jobs.
 
-The decisive probe, in order — if step 4 fails, stop, the design is dead:
+### RESULT: criu CAN dump BC. `docker start --checkpoint` cannot restore it.
+
+Run 9 of the probe, ubuntu-22.04 / kernel 6.8.0-1062-azure / criu from apt,
+with `/etc/criu/runc.conf` containing `tcp-established`, `tcp-close`,
+`file-locks`, `ext-unix-sk`, `link-remap`, `ghost-limit 512M`:
+
+```
+checkpoint took 47s
+container status after checkpoint: exited     <- dump succeeded, container really stopped
+```
+
+**A fully booted BC service tier checkpoints cleanly** — 40 threads, 838 fds,
+~17 established connections to SQL, 2.16 GB of private dirty pages, 47s, and
+not one `Error (criu…)` line. Every barrier found on the way was a criu config
+option, not a BC incompatibility:
+
+| barrier | run | fix |
+|---|---|---|
+| `Connected TCP socket` (the SQL pool) | 7 | `tcp-established` |
+| `Some file locks are hold by dumping tasks` | 8 | `file-locks` |
+
+Restore is where it stops, and the failure is Docker's, not criu's or BC's:
+
+```
+Error response from daemon: bind-mount /proc/0/ns/net
+  -> /var/run/docker/netns/7acc266207d3: no such file or directory
+```
+
+`/proc/0/ns/net` is PID 0's network namespace, which cannot exist. Docker's
+checkpoint/restore cannot rebuild the netns for a container on a user-defined
+bridge network, which is exactly what compose creates. Nothing about this is
+addressable from our side of the boundary.
+
+**So the conclusion is narrow and useful: the CRIU half is proven, the
+docker-checkpoint half is a dead end.** If this is picked up, do not spend
+another run on `docker start --checkpoint`. The routes that remain:
+
+- **podman** — `podman container checkpoint/restore` is first-class rather than
+  experimental (Red Hat maintains both podman and criu), supports these options
+  directly as flags, and is the only mainstream runtime where this is a
+  supported feature rather than a 8-year-old experiment. Untried.
+- **`runc restore` directly**, bypassing the daemon's netns handling.
+
+And the two constraints that survive regardless: restore still needs a SQL peer
+whose TCP sequence numbers match, so a FRESH SQL container remains the hard
+untested case; and a hosted runner is ephemeral, so none of this measures the
+win, which exists only where the checkpoint survives between jobs.
+
+Nine runs got here. Five were spent on defects in the probe rather than the
+question — if you resume this, do it on a box where `criu dump` runs
+interactively in seconds instead of five-minute CI round trips.
+
+The original probe recipe, retained for a self-hosted attempt:
 
 1. Host with `CONFIG_CHECKPOINT_RESTORE=y`; `apt-get install criu`;
    `criu check --all`.

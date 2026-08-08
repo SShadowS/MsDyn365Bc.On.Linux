@@ -754,7 +754,13 @@ jobs:
             echo "::error::BC restored and served OData but a novel app would not publish — tenant did not survive"
             exit 1
           fi
-          echo "Restore verified. Next question is the hard one: restoring against a FRESH SQL container."
+          if [ "${{ steps.sqlfresh.outcome }}" = "success" ]; then
+            echo "Restore verified against a FRESH SQL container with the database reloaded."
+            echo "What is left is not feasibility: carry the checkpoint and the backup across a"
+            echo "job boundary, and work out what invalidates them."
+          else
+            echo "Restore verified, but against the SAME live SQL container — the easy case."
+          fi
 
       - name: Upload criu dump log
         if: always()

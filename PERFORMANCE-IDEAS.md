@@ -112,12 +112,21 @@ Not attempted here: this session ran on a Firecracker microVM whose kernel has
 level and `docker checkpoint` (which sits on CRIU) is unavailable with it.
 Stock Ubuntu hosts have the option enabled and `criu` in universe.
 
-### Probed on GitHub-hosted runners, 2026-08-08 — IT WORKS; skip to "RESULT (run 16)"
+### Probed on GitHub-hosted runners, 2026-08-08 — IT WORKS; skip to "RESULT (run 18)"
 
 Everything between here and that section is the path, kept because each dead
 end costs a five-minute run to rediscover. The headline is that a booted BC
-service tier checkpoints and restores intact: 127s of boot replaced by 30s of
-restore, with the tenant still able to publish a newly compiled app.
+service tier checkpoints and restores intact — 137s of boot replaced by a 25s
+restore, with the tenant still able to publish a newly compiled app — **and it
+does so against a brand-new SQL Server container**, which was the case the whole
+design hinged on.
+
+The economics, up front, because they decide where this is worth building:
+the checkpoint is 2.1 GB and the database backup 539 MB. On a self-hosted
+runner they sit on disk and cost nothing. On a GitHub-hosted runner they would
+have to go through the Actions cache — the artifact-caching ban in CLAUDE.md,
+verbatim — and the 46s checkpoint plus that transfer is worse than the 137s
+boot it replaces. **This is a self-hosted-runner feature.**
 
 ### The path — the wall was NOT the SQL socket pool
 
@@ -152,6 +161,38 @@ RESTORE still needs a peer whose sequence numbers match, so restoring against a
 fresh SQL container remains the hard, untested case. And a hosted runner is
 ephemeral, so none of this measures the win — that only exists where the
 checkpoint survives between jobs.
+
+### RESULT (run 18): it survives a FRESH SQL container too. 137s boot -> 25s restore.
+
+The case that decides the design, not the easy one. sql is a different container
+(id checked), its tmpfs verified empty of CRONUS before the database is reloaded
+from a backup taken after the checkpoint, and the BC login recreated because it
+went down with `master`:
+
+```
+cold boot to healthy: 137s
+checkpoint took 46s              container status after checkpoint: exited
+/tmp/sqlsnap/cronus.bak          539M
+sql container: 8546dffa4b51 -> 6750dafdccdc
+confirmed: fresh sql has no CRONUS database
+logical names: data='Navision_NAV_Data' log='Navision_NAV_Log'
+restore to OData 200: 25s
+OData /Company : 200             publish HTTP 200   <- novel app, compiled after restore
+```
+
+So a restored NST reconnects to a SQL Server it has never spoken to, holding a
+connection pool whose peer no longer exists, and the tenant still works well
+enough to publish a freshly compiled extension. **Feasibility is settled.**
+
+What is left is engineering, not risk:
+
+- carry the checkpoint (2.1 GB) and the backup (539 MB) across a job boundary —
+  on a self-hosted runner that is "leave them on disk", which is the only place
+  the economics work anyway (see point 2 below)
+- decide what invalidates the pair: BC version, image, and the published app set
+  at minimum — same shape as the three stamps in CLAUDE.md
+- the two halves are **not independently restorable**. A BC checkpoint is only
+  usable with a snapshot of the database it was booted against.
 
 ### RESULT (run 16): it works. A booted BC restores in 30s and still publishes.
 
@@ -220,6 +261,9 @@ What is still open, in the order it matters:
    That shape is also the answer to "what would production look like": a BC
    checkpoint is only usable together with a snapshot of the database it was
    booted against. Neither half is independently restorable.
+
+   **Run 18 ran exactly that and passed** — see the RESULT section above. This
+   item is closed; what remains of it is the job boundary, in point 2.
 2. **Moving the payload.** 2.1 GB per checkpoint. On a self-hosted runner it
    sits on disk and costs nothing. Through GitHub's cache it is the artifact
    caching ban all over again (CLAUDE.md) — 10 GB repo cap, upload every run —

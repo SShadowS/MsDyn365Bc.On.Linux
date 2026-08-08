@@ -338,9 +338,10 @@ _prepare_sqldir() {
   rm -f "$d/cronus.bak" 2>/dev/null || true
 }
 
-# The checkpoint is written by the docker daemon, so it is root-owned and mode
-# 700 whatever the caller is. Deleting or sizing the store therefore needs sudo
-# on any machine where the runner is not root -- which is all of them.
+# The store is ours: _export_checkpoint chowns the copied checkpoint to the
+# invoking user, so deleting and sizing it need no privilege. (Stores written
+# before that change hold a root-owned checkpoint and must be removed by hand;
+# the message below says so rather than silently reaching for sudo.)
 # The store is only half of a snapshot; the other half is the committed rootfs
 # image. Dropping one without the other leaves either a snapshot that cannot
 # restore or an image nothing will ever use, so they go together.
@@ -429,8 +430,9 @@ create() {
   [ "$(docker inspect --format '{{.State.Status}}' "$cid")" = "exited" ] \
     || die "bc still running after checkpoint — nothing was captured"
   log "checkpoint written in $(( $(date +%s) - t0 ))s"
-  # Copied rather than written in place; see _ckpt_path above for why. root-owned
-  # mode 700, so both the read and the ownership fix need sudo.
+  # Copied rather than written in place; see _ckpt_path above for why. The
+  # daemon writes it root:700, so the copy goes through a container on the
+  # docker socket -- authority this caller already has -- instead of sudo.
   # --reflink=auto: a copy-on-write clone on btrfs/XFS (near-instant, no extra
   # space) and an ordinary copy everywhere else. The two 2.1 GB copies are the
   # largest single component of restore time on a fast disk, so this is worth

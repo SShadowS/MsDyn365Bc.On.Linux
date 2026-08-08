@@ -375,9 +375,25 @@ _rm_store() {
 }
 _du_store() { du -sh "$1" 2>/dev/null | cut -f1 || echo "?"; }
 
+# Returns the HTTP code, or 000. Any error text goes to a file rather than
+# /dev/null, because "000" on its own has now twice been the only thing a
+# failure said for itself.
 _bc_odata() {
-  docker compose exec -T bc curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-    -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company 2>/dev/null || echo 000
+  local code
+  code=$(docker compose exec -T bc curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+    -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company 2>/tmp/snapshot-odata.err) || true
+  printf '%s' "${code:-000}"
+}
+
+# Everything known about why BC is not answering. Called wherever a non-200
+# would otherwise be reported as a bare number.
+_odata_diagnosis() {
+  log "  docker compose exec stderr: $(head -c 300 /tmp/snapshot-odata.err 2>/dev/null | tr '\n' ' ')"
+  log "  bc container: $(docker compose ps --format '{{.Name}} {{.State}} {{.Health}}' bc 2>/dev/null | head -1)"
+  log "  host port 7048: $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+        -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company 2>/dev/null || echo unreachable)"
+  log "  --- bc log tail ---"
+  docker compose logs bc --tail 12 2>&1 | cut -c1-160 >&2 || true
 }
 
 # ─── docker will not restore from a custom checkpoint directory ───────────────
@@ -431,7 +447,15 @@ create() {
   s=$(_store) || die "cannot compute a snapshot key (run: scripts/snapshot.sh key)"
   cid=$(docker compose ps -q bc || true)
   [ -n "$cid" ] || die "no running bc container"
-  [ "$(_bc_odata)" = "200" ] || die "bc is not serving OData — refusing to snapshot a BC that is not healthy"
+  local odata; odata=$(_bc_odata)
+  if [ "$odata" != "200" ]; then
+    log "bc is not serving OData (HTTP $odata) — refusing to snapshot an unhealthy BC"
+    # The caller's own readiness probe had just passed against the same URL on
+    # the host, so the disagreement itself is the clue: a different container
+    # answering the host port, or exec failing rather than curl.
+    _odata_diagnosis
+    die "bc not healthy at snapshot time"
+  fi
 
   _rm_store "$s"; mkdir -p "$s/checkpoint"
   CREATE_STORE="$s"
@@ -646,6 +670,7 @@ restore() {
   done
   if [ "$(_bc_odata)" != "200" ]; then
     log "restored bc never served OData — cold boot"
+    _odata_diagnosis
     _discard "$s" "restored bc did not serve OData"
     return 1
   fi

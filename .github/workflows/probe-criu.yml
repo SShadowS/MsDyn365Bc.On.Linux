@@ -195,15 +195,26 @@ jobs:
           echo "dockerd sees: $(sudo docker info 2>/dev/null | grep -iE 'runtime|storage driver' | tr '\n' ' ')"
           if ! docker checkpoint create --leave-running=false "$CID" cp1 2>checkpoint.err; then
             cat checkpoint.err
+            # The daemon error only says "criu failed: type DUMP" and points at a
+            # log file. THAT file has the actual reason; without it every failure
+            # looks the same and classifies as "other".
+            DUMPLOG="/run/containerd/io.containerd.runtime.v2.task/moby/$CID/criu-dump.log"
+            echo "--- criu-dump.log ---"
+            sudo tail -40 "$DUMPLOG" 2>/dev/null || sudo find /run/containerd /var/lib/docker -name 'criu-dump.log' -exec tail -40 {} \; 2>/dev/null || echo "(criu-dump.log not found)"
+            sudo cp "$DUMPLOG" ./criu-dump.log 2>/dev/null || true
             # Put it where a phone can read it: the run summary, not 1700 log lines.
             {
               echo "### Checkpoint failed"
               echo '```'
-              head -c 800 checkpoint.err
+              head -c 500 checkpoint.err
+              echo '```'
+              echo "**criu-dump.log (the actual reason):**"
+              echo '```'
+              sudo tail -25 ./criu-dump.log 2>/dev/null || echo "(not captured)"
               echo '```'
               echo "criu on PATH: \`$(command -v criu || echo NONE)\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            if grep -qiE "tcp|socket|established" checkpoint.err; then
+            if grep -qiE "tcp|socket|established" checkpoint.err ./criu-dump.log 2>/dev/null; then
               echo "::warning::checkpoint refused on established TCP connections — expected; retry via raw criu --tcp-established"
               echo "classification=tcp-sockets" >> "$GITHUB_OUTPUT"
             else
@@ -342,6 +353,14 @@ jobs:
             exit 1
           fi
           echo "Restore verified. Next question is the hard one: restoring against a FRESH SQL container."
+
+      - name: Upload criu dump log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criu-dump-log
+          path: criu-dump.log
+          if-no-files-found: ignore
 
       - name: Diagnostics on failure
         if: failure()

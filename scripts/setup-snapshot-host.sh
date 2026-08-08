@@ -12,8 +12,16 @@
 #   2. add {"experimental": true} to        (MERGED into the existing file, and
 #      /etc/docker/daemon.json               restarting docker STOPS YOUR
 #                                            CONTAINERS — it asks first)
-#   3. create the snapshot store directory  (this is the per-machine opt-in)
-#   4. check passwordless sudo + docker access for the current user
+#   3. persist vm.overcommit_memory and     (/etc/sysctl.d/99-bc-snapshot.conf)
+#      vm.max_map_count
+#   4. write /etc/criu/runc.conf            (runc reads it when the daemon
+#                                            invokes criu; no CLI flag reaches it)
+#   5. create the snapshot store and        (creating the store IS the
+#      artifact cache directories            per-machine opt-in)
+#   6. check docker access for this user
+#
+# 3-5 are why scripts/snapshot.sh itself needs no root: the privileged parts are
+# one-time host configuration, done here, rather than repeated on every run.
 #
 # What it will never do: replace daemon.json, remove anything, or restart docker
 # without saying so.
@@ -58,9 +66,6 @@ else
 fi
 
 # ── 2. passwordless sudo ──────────────────────────────────────────────────────
-# snapshot.sh needs sudo for the sysctls, /etc/criu/runc.conf, and the
-# root-owned checkpoint the daemon writes. A password prompt inside a CI job
-# hangs the job rather than failing it, so this is worth checking explicitly.
 # `sudo -n true` alone is a FALSE PASS in an interactive shell: sudo caches a
 # timestamp for a few minutes after you type a password, so it succeeds without
 # proving any policy. -k drops that cache first, which is what a CI job's fresh

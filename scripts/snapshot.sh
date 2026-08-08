@@ -385,6 +385,30 @@ _sqlcmd() { docker compose exec -T sql /opt/mssql-tools18/bin/sqlcmd -b -S local
 # setting MSSQL_PID; Express does not, which is why every failure here is soft.
 DB_SNAP=CRONUS_bcsnap
 
+# criu restore time tracks the NUMBER of mappings rather than the bytes: the
+# checkpoint is 2.2 GB, which is a second or two of NVMe, yet the restore takes
+# 18s. This NST needs vm.max_map_count >= 2^20 and carries a ~263 GB VmSize
+# that is nearly all Server GC reservation, so this number decides whether
+# reducing those reservations could recover most of the restore or none of it.
+#
+# Written as a standalone single-quoted script rather than inline in a log
+# line: the first version nested `awk "...\$2..."` inside `$( )` inside `"`,
+# where the backslashes are literal and the awk program arrived corrupted. It
+# reported "unknown" for a whole run. Scanning /proc beats pgrep, which the
+# runtime image does not ship.
+_nst_mappings() {
+  docker compose exec -T bc sh -c '
+    for d in /proc/[0-9]*; do
+      c=$(cat "$d/comm" 2>/dev/null) || continue
+      case "$c" in
+        dotnet|Microsoft.Dynamics*)
+          printf "%s vmas, %s" "$(wc -l < "$d/maps")" "$(grep VmSize "$d/status")"
+          exit 0 ;;
+      esac
+    done
+    echo "no NST process found"' 2>/dev/null || echo "probe failed"
+}
+
 _create_db_snapshot() {
   # One entry per DATA file (log files are excluded from snapshots). Building
   # the list in T-SQL keeps it correct if the demo database ever gains a file.
@@ -392,9 +416,14 @@ _create_db_snapshot() {
   if ! out=$(_sqlcmd -h -1 -W -Q "
     SET NOCOUNT ON;
     IF DB_ID('$DB_SNAP') IS NOT NULL DROP DATABASE [$DB_SNAP];
+    -- sys.master_files, NOT sys.database_files: this connection is on master,
+    -- where sys.database_files describes MASTER's files. Enumerating those
+    -- produced 'All files must be specified for database snapshot creation.
+    -- Missing the file "Navision..."' and silently disabled the fast path.
     DECLARE @f nvarchar(max) = STUFF((
       SELECT ', (NAME = [' + name + '], FILENAME = ''/var/opt/mssql/data/' + name + '_bcsnap.ss'')'
-      FROM sys.database_files WHERE type_desc = 'ROWS' FOR XML PATH('')), 1, 2, '');
+      FROM sys.master_files WHERE database_id = DB_ID('CRONUS') AND type_desc = 'ROWS'
+      FOR XML PATH('')), 1, 2, '');
     EXEC('CREATE DATABASE [$DB_SNAP] ON ' + @f + ' AS SNAPSHOT OF [CRONUS]');" 2>&1); then
     log "  (no database snapshot: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-140))"
     log "  restores will rebuild from the backup — correct, just slower"
@@ -673,9 +702,7 @@ create() {
   # or whether they are a handful of large mappings and would recover nothing.
   # Measured, not assumed, because the trade is real: gcServer=1 is there for
   # the parallel Roslyn compile during startup.
-  log "  nst mappings: $(docker compose exec -T bc sh -c \
-    'p=$(pgrep -n dotnet 2>/dev/null); [ -n "$p" ] && printf "%s vmas, %s" "$(wc -l < /proc/$p/maps)" "$(awk "/VmSize/{print \$2\" \"\$3}" /proc/$p/status)"' \
-    2>/dev/null || echo unknown)"
+  log "  nst mappings: $(_nst_mappings)"
   t0=$(date +%s)
   # --leave-running=false: the process must really stop, otherwise the backup
   # below races a BC that is still writing and the two halves disagree.

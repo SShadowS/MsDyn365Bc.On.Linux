@@ -125,6 +125,14 @@ jobs:
             awk "/^Private_Dirty/{s+=\$2} END{printf \"NST private dirty (checkpoint payload): %.2f GB\n\", s/1048576}" /proc/$PID/smaps'
 
       # ── The probe itself ──────────────────────────────────────────────────
+      # KNOWN RISK: `docker checkpoint create` does not expose CRIU's
+      # --tcp-established. BC holds ~17 pooled connections to SQL, and CRIU
+      # refuses to dump established TCP sockets unless told to. If this step
+      # fails complaining about TCP/sockets, that is NOT "BC cannot be
+      # checkpointed" — it means the docker-checkpoint route is unusable and
+      # the experiment has to drive criu directly (nsenter into the container's
+      # namespaces, `criu dump --tcp-established --shell-job`). The error is
+      # captured below so the two cases can be told apart.
       - name: Checkpoint the running container
         id: checkpoint
         continue-on-error: true
@@ -132,7 +140,17 @@ jobs:
           set -e
           CID="${{ steps.boot.outputs.cid }}"
           T0=$(date +%s)
-          docker checkpoint create --leave-running=false "$CID" cp1
+          if ! docker checkpoint create --leave-running=false "$CID" cp1 2>checkpoint.err; then
+            cat checkpoint.err
+            if grep -qiE "tcp|socket|established" checkpoint.err; then
+              echo "::warning::checkpoint refused on established TCP connections — expected; retry via raw criu --tcp-established"
+              echo "classification=tcp-sockets" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::checkpoint failed for another reason — see the error above"
+              echo "classification=other" >> "$GITHUB_OUTPUT"
+            fi
+            exit 1
+          fi
           T1=$(date +%s)
           echo "checkpoint_s=$((T1-T0))" >> "$GITHUB_OUTPUT"
           echo "checkpoint took $((T1-T0))s"
@@ -227,6 +245,10 @@ jobs:
             echo "restoring against a fresh SQL container is strictly harder."
           } >> "$GITHUB_STEP_SUMMARY"
 
+          if [ "${{ steps.checkpoint.outputs.classification }}" = "tcp-sockets" ]; then
+            echo "::error::Checkpoint refused on established TCP connections. This does NOT rule out CRIU — docker checkpoint cannot pass --tcp-established. Next step is driving criu directly inside the container namespaces."
+            exit 1
+          fi
           if [ "${{ steps.restore.outcome }}" != "success" ] || [ "${{ steps.restore.outputs.odata }}" != "200" ]; then
             echo "::error::BC did not come back from the checkpoint — the design is dead as specified"
             exit 1

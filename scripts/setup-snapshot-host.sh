@@ -76,11 +76,30 @@ if [ -n "$CRIU_HAVE" ] && [ "$(printf '%s\n%s\n' "$CRIU_MIN" "$CRIU_HAVE" | sort
 else
   todo "criu ${CRIU_HAVE:-not installed} — need >= $CRIU_MIN (3.17 dumps BC fine then segfaults the restore)"
   if [ "$CHECK_ONLY" = 0 ] && ask "build criu $CRIU_REF from source and install it?"; then
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq build-essential git pkg-config libprotobuf-dev \
-      libprotobuf-c-dev protobuf-c-compiler protobuf-compiler python3-protobuf \
-      libnl-3-dev libnet-dev libcap-dev libbsd-dev libgnutls28-dev libnftables-dev iproute2 \
-      || { bad "could not install build dependencies"; NEED=1; }
+    # Distro-aware, because this is meant for real machines and not everyone is
+    # on Debian. Anything unrecognised gets the dependency list rather than a
+    # confusing "apt-get: command not found".
+    if command -v apt-get >/dev/null; then
+      sudo apt-get update -qq
+      sudo apt-get install -y -qq build-essential git pkg-config libprotobuf-dev \
+        libprotobuf-c-dev protobuf-c-compiler protobuf-compiler python3-protobuf \
+        libnl-3-dev libnet-dev libcap-dev libbsd-dev libgnutls28-dev libnftables-dev iproute2 \
+        || { bad "could not install build dependencies"; NEED=1; }
+    elif command -v pacman >/dev/null; then
+      # criu is also in the AUR on Arch; building from source here keeps the
+      # version pinned to what this feature is tested against.
+      sudo pacman -S --needed --noconfirm base-devel git protobuf protobuf-c \
+        python-protobuf libnl libnet libbsd gnutls nftables iproute2 \
+        || { bad "could not install build dependencies"; NEED=1; }
+    elif command -v dnf >/dev/null; then
+      sudo dnf install -y gcc make git protobuf-devel protobuf-c-devel python3-protobuf \
+        libnl3-devel libnet-devel libcap-devel libbsd-devel gnutls-devel nftables-devel iproute \
+        || { bad "could not install build dependencies"; NEED=1; }
+    else
+      bad "unknown package manager — install criu's build dependencies manually"
+      echo "        see https://criu.org/Installation"
+      NEED=1
+    fi
     rm -rf /tmp/criu-build
     git clone --depth 1 --branch "$CRIU_REF" https://github.com/checkpoint-restore/criu.git /tmp/criu-build \
       && make -C /tmp/criu-build -j"$(nproc)" >/dev/null 2>&1 \
@@ -96,11 +115,24 @@ fi
 # criu can be installed and still unable to run: on some kernels it cannot parse
 # its own vDSO and fails before touching any process. Better to find out now.
 if command -v criu >/dev/null; then
-  if sudo criu check 2>&1 | grep -qE 'kerndat|vdso|Could not initialize kernel features'; then
-    bad "criu cannot initialise on kernel $(uname -r) — snapshot mode cannot work on this host"
-    NEED=1
-  else
+  # Judge this by criu's EXIT CODE, not by grepping its output. `criu check`
+  # prints "Warn (criu/kerndat.c:...): Can't load /run/criu.kdat" on every first
+  # run — the kdat cache simply does not exist yet — and an earlier version of
+  # this script matched "kerndat" anywhere and declared the host unusable. It
+  # also never showed the reason, which is the same mistake that cost three CI
+  # runs elsewhere in this feature.
+  if CRIU_CHECK_OUT=$(sudo criu check 2>&1); then
     ok "criu check passes on kernel $(uname -r)"
+  else
+    bad "criu check failed on kernel $(uname -r):"
+    echo "$CRIU_CHECK_OUT" | grep -E '^(Error|Warn)' | tail -8 | sed 's/^/        /'
+    echo "        (full output: sudo criu check)"
+    if echo "$CRIU_CHECK_OUT" | grep -qiE 'vdso|kerndat_vdso'; then
+      echo "        This looks like the vDSO-parsing failure criu hits on very new"
+      echo "        kernels. Options: build criu from git master (the fix may have"
+      echo "        landed since 4.2.1), or run on an LTS kernel."
+    fi
+    NEED=1
   fi
 fi
 

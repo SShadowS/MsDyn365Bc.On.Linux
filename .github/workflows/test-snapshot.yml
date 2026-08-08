@@ -148,9 +148,13 @@ jobs:
           criu --version
           # Hard gate: this reported exit 1 on the 6.17 kernel and the run went
           # on to boot BC for two minutes before failing for that same reason.
-          sudo criu check 2>&1 | tee criu-check.out || true
-          grep -qE 'kerndat|vdso|Could not initialize kernel features' criu-check.out \
-            && { echo "::error::criu cannot initialise on kernel $(uname -r)"; exit 1; } || true
+          # Exit code, not a grep: "Warn (criu/kerndat.c): Can't load
+          # /run/criu.kdat" is printed on every first run and means nothing.
+          if ! sudo criu check 2>&1 | tee criu-check.out; then
+            echo "::error::criu check failed on kernel $(uname -r)"
+            grep -E '^(Error|Warn)' criu-check.out | tail -8
+            exit 1
+          fi
           # MERGE, never replace. Even on a throwaway VM the runner image ships a
           # daemon.json, and clobbering it is a habit that eventually runs
           # somewhere it matters.

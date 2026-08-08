@@ -65,6 +65,17 @@ check invalidates "a .NET GC tuning knob"             BC_KEEP_APP_IDS=aaa,bbb DO
 check invalidates "the SQL password"                  BC_KEEP_APP_IDS=aaa,bbb SA_PASSWORD=Different1!
 check invalidates "BC_TEST_APPS set"                  BC_KEEP_APP_IDS=aaa,bbb BC_TEST_APPS=/tmp/x.app
 
+# Localization. The country lives in the resolved APP url (the platform url is
+# country-independent) AND in BC_COUNTRY on bc's environment, so it is keyed
+# twice over. Asserted on the artifact path here and the env path below, because
+# either one alone is sufficient and a refactor could plausibly drop one of them
+# without anything else noticing.
+printf 'key=v1|https://x/sandbox/28.1.49838.53507/de|https://x/sandbox/28.1.49838.53507/platform\n' \
+  > "$TMP2/.bc-artifact-cache"
+check invalidates "a different country in the artifact url" BC_KEEP_APP_IDS=aaa,bbb BC_ARTIFACTS_DIR="$TMP2"
+check invalidates "a different BC_COUNTRY"                  BC_KEEP_APP_IDS=aaa,bbb BC_COUNTRY=de
+check invalidates "a different BC_TYPE"                     BC_KEEP_APP_IDS=aaa,bbb BC_TYPE=onprem
+
 # The one that matters most for hit rate: a Microsoft hotfix under the same
 # short version resolves to a new url, and that has to be a miss.
 printf 'key=v1|https://x/sandbox/28.1.49999.99999/w1|https://x/sandbox/28.1.49999.99999/platform\n' \

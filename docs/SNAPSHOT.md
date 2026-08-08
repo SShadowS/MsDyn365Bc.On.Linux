@@ -119,13 +119,26 @@ runtime=<criu version>|<architecture>
 Each component is here because changing it makes the checkpoint **wrong**, not
 merely old.
 
-### `artifact` — which BC build
+### `artifact` — which BC build, country and type
 
 The **resolved** urls, read from `download-artifacts.sh`'s own
 `.bc-artifact-cache` stamp — not the version you asked for. This is the single
 biggest lever you have over hit rate, and it is covered in
 [Keeping a snapshot valid](#keeping-a-snapshot-valid-for-as-long-as-possible)
 below.
+
+**Localization is in here.** The country and the artifact type are part of the
+app url — `…/sandbox/28.1.49838.53507/w1` versus `…/de` — so a `w1` snapshot can
+never be handed to a `de` run. That matters more than it might look: the country
+determines the demo database that gets restored, the localized app set published
+into it, and the evaluation company name, all of which are baked into the
+checkpoint and its paired backup.
+
+It is keyed twice over, in fact — `BC_COUNTRY` and `BC_TYPE` also reach `config`
+through bc's environment. Either alone would be sufficient; both are asserted by
+`test-snapshot-key.sh` so a refactor cannot quietly drop one. Note that the
+*platform* url is country-independent, so the app url is the half that carries
+it.
 
 ### `image` — which bc-runner
 

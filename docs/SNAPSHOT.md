@@ -97,6 +97,23 @@ writes and which a resumed process never reaches.
 `scripts/snapshot.sh key` prints the key and every component of it — that is the
 first thing to run when a hit was expected and did not happen.
 
+### Why the checkpoint is copied around
+
+`docker checkpoint create --checkpoint-dir` is accepted, but the matching
+`docker start --checkpoint-dir` is **not** — the daemon answers `custom
+checkpointdir is not supported`. The flag exists on the CLI and is unimplemented
+in the daemon's start path. It is not a CRIU limitation and no CRIU option
+changes it.
+
+So the checkpoint is taken where docker expects it
+(`<docker-root>/containers/<id>/checkpoints/cp1`), copied out into the store,
+and copied back into the *new* container's directory on restore — a different
+path, because it is a different container id. That is two 2.1 GB local copies
+per cycle, which is cheap next to the boot it replaces, and it is the reason
+`podman` would be a tidier host for this feature if it ever needs one: its
+`checkpoint --export` / `restore --import` are the supported way to do exactly
+this.
+
 `docker-compose.snapshot.yml` is required, not optional. It puts `bc` on host
 networking (Docker cannot rebuild a bridge network namespace on restore) and
 mounts the backup directory into `sql` (`RESTORE FROM DISK` reads SQL Server's

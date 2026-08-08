@@ -315,6 +315,24 @@ _bc_odata() {
     -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company 2>/dev/null || echo 000
 }
 
+# ─── docker will not restore from a custom checkpoint directory ───────────────
+#
+# `docker checkpoint create --checkpoint-dir` is accepted, but the matching
+# `docker start --checkpoint-dir` is NOT: the daemon answers
+#
+#   Error response from daemon: custom checkpointdir is not supported
+#
+# so a checkpoint written straight into the store can never be restored from
+# there. The flag exists on the CLI and is unimplemented in the daemon's start
+# path; it is not a criu limitation and no criu option changes it.
+#
+# The way through is to let docker keep the checkpoint where it expects —
+# <docker-root>/containers/<cid>/checkpoints/<name> — and move it in and out of
+# the store ourselves. Restore copies it into the NEW container's directory,
+# which is a different path because it is a different container id.
+_docker_root() { docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker; }
+_ckpt_path()   { echo "$(_docker_root)/containers/$1/checkpoints"; }
+
 # ─── status ───────────────────────────────────────────────────────────────────
 status() {
   local root
@@ -359,10 +377,14 @@ create() {
   t0=$(date +%s)
   # --leave-running=false: the process must really stop, otherwise the backup
   # below races a BC that is still writing and the two halves disagree.
-  docker checkpoint create --checkpoint-dir "$s/checkpoint" --leave-running=false "$cid" cp1
+  docker checkpoint create --leave-running=false "$cid" cp1
   [ "$(docker inspect --format '{{.State.Status}}' "$cid")" = "exited" ] \
     || die "bc still running after checkpoint — nothing was captured"
   log "checkpoint written in $(( $(date +%s) - t0 ))s"
+  # Copied rather than written in place; see _ckpt_path above for why. root-owned
+  # mode 700, so both the read and the ownership fix need sudo.
+  sudo cp -a "$(_ckpt_path "$cid")/cp1" "$s/checkpoint/cp1"
+  [ -d "$s/checkpoint/cp1" ] || die "checkpoint did not copy into the store"
 
   # AFTER the checkpoint, so the database matches the frozen process exactly.
   _prepare_sqldir
@@ -385,7 +407,7 @@ create() {
   # run the entrypoint and cold-boot it all over again. Resume from the
   # checkpoint we just took instead: the caller asked for a snapshot, not for
   # their BC to be taken away.
-  if docker start --checkpoint-dir "$s/checkpoint" --checkpoint cp1 "$cid" 2>/tmp/snapshot-resume.err; then
+  if docker start --checkpoint cp1 "$cid" 2>/tmp/snapshot-resume.err; then
     _mark_ready
     log "bc resumed from the checkpoint it just wrote"
   else
@@ -473,7 +495,12 @@ restore() {
   docker compose create bc >/dev/null
   local cid; cid=$(docker compose ps -aq bc)
   [ -n "$cid" ] || { log "could not create the bc container — cold boot"; return 1; }
-  if ! docker start --checkpoint-dir "$s/checkpoint" --checkpoint cp1 "$cid" 2>/tmp/snapshot-restore.err; then
+  # The new container has a new id, so its checkpoint directory is a new path.
+  local dst; dst=$(_ckpt_path "$cid")
+  sudo mkdir -p "$dst"
+  sudo rm -rf "${dst:?}/cp1"
+  sudo cp -a "$s/checkpoint/cp1" "$dst/cp1"
+  if ! docker start --checkpoint cp1 "$cid" 2>/tmp/snapshot-restore.err; then
     log "restore failed — cold boot:"; sed -n 1,5p /tmp/snapshot-restore.err >&2
     sudo grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
     _discard "$s" "restore failed"

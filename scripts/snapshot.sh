@@ -340,9 +340,12 @@ _prepare_sqldir() {
     [ -n "$base" ] && [ "$base" != "." ] && [ "$base" != "/" ] \
       || die "refusing to repair a suspicious staging path: $d"
     log "repairing $d (owner $(stat -c %U "$d" 2>/dev/null || echo unknown)) via the docker socket"
-    docker run --rm -v "$(dirname "$d")":/p --entrypoint sh "$(_bc_image_ref)" -c \
-      "rm -rf '/p/$base' && mkdir -p '/p/$base' && chmod 777 '/p/$base' && chown $(id -u):$(id -g) '/p/$base'" \
-      >/dev/null 2>&1 || true
+    # IN PLACE. Recreating the directory (rm -rf + mkdir) detaches any running
+    # container's bind mount: sql keeps the old, now-unlinked inode and its
+    # writes land in a directory nothing else can see. Fixing the mode on the
+    # existing inode leaves every mount intact.
+    docker run --rm -v "$d":/s --entrypoint sh "$(_bc_image_ref)" -c \
+      "chmod 777 /s && chown $(id -u):$(id -g) /s" >/dev/null 2>&1 || true
   fi
   [ -w "$d" ] || die "cannot write $d — remove it and retry: sudo rm -rf $d"
   # SQL Server wrote the previous backup as uid 10001 mode 640. cp TRUNCATES an
@@ -472,7 +475,14 @@ create() {
 
   # AFTER the checkpoint, so the database matches the frozen process exactly.
   _prepare_sqldir
-  _sqlcmd -Q "BACKUP DATABASE [CRONUS] TO DISK='/sqlsnap/cronus.bak' WITH COPY_ONLY, INIT, COMPRESSION" >/dev/null
+  # NOT >/dev/null: sqlcmd reports T-SQL errors on stdout, so discarding it
+  # throws away the only explanation of a failed backup. -b makes the exit code
+  # meaningful; this makes the reason visible.
+  local bkout
+  if ! bkout=$(_sqlcmd -Q "BACKUP DATABASE [CRONUS] TO DISK='/sqlsnap/cronus.bak' WITH COPY_ONLY, INIT, COMPRESSION" 2>&1); then
+    log "BACKUP DATABASE failed:"; echo "$bkout" | tail -6 >&2
+    die "could not back up the database"
+  fi
   # Streamed out through the container rather than copied on the host: SQL
   # writes the backup as uid 10001 mode 640, which the runner user cannot read.
   docker compose exec -T sql cat /sqlsnap/cronus.bak > "$s/cronus.bak"
@@ -564,7 +574,8 @@ restore() {
   _sqlcmd -Q "
     IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = '$dbu')
         CREATE LOGIN [$dbu] WITH PASSWORD = '$dbp', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;
-    ALTER SERVER ROLE sysadmin ADD MEMBER [$dbu];" >/dev/null
+    ALTER SERVER ROLE sysadmin ADD MEMBER [$dbu];" >/dev/null 2>&1 || {
+      log "could not create the BC login on the fresh sql container — cold boot"; return 1; }
   local d l
   d=$(_sqlcmd -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" 2>/dev/null | head -1 | cut -f1 || true)
   l=$(_sqlcmd -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" 2>/dev/null | head -2 | tail -1 | cut -f1 || true)
@@ -572,10 +583,14 @@ restore() {
     log "could not read the backup's file list — cold boot"
     return 1
   fi
-  _sqlcmd -Q "
+  local rsout
+  if ! rsout=$(_sqlcmd -Q "
     RESTORE DATABASE [CRONUS] FROM DISK='/sqlsnap/cronus.bak'
     WITH MOVE '$d' TO '/var/opt/mssql/data/CRONUS.mdf',
-         MOVE '$l' TO '/var/opt/mssql/data/CRONUS_log.ldf', REPLACE" >/dev/null
+         MOVE '$l' TO '/var/opt/mssql/data/CRONUS_log.ldf', REPLACE" 2>&1); then
+    log "RESTORE DATABASE failed — cold boot:"; echo "$rsout" | tail -6 >&2
+    return 1
+  fi
   log "database restored"
 
   # The container has to exist with the same configuration before its process

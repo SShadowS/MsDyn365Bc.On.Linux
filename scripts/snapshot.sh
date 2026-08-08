@@ -289,7 +289,7 @@ _create_failed() {
   trap - EXIT
   [ "$rc" -eq 0 ] && return 0
   log "create failed — discarding the partial snapshot and bringing bc back"
-  [ -n "${CREATE_STORE:-}" ] && rm -rf "${CREATE_STORE:?}"
+  [ -n "${CREATE_STORE:-}" ] && _rm_store "$CREATE_STORE"
   docker compose up -d --wait >/dev/null 2>&1 || true
   return "$rc"
 }
@@ -298,7 +298,17 @@ _prepare_sqldir() {
   local d="${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}"
   mkdir -p "$d" 2>/dev/null || sudo mkdir -p "$d"
   chmod 777 "$d" 2>/dev/null || sudo chmod 777 "$d"
+  # SQL Server wrote the previous backup as uid 10001 mode 640. cp TRUNCATES an
+  # existing file, which needs write permission on the FILE — a 777 directory
+  # does not help. Remove it first; unlink only needs the directory.
+  rm -f "$d/cronus.bak" 2>/dev/null || sudo rm -f "$d/cronus.bak"
 }
+
+# The checkpoint is written by the docker daemon, so it is root-owned and mode
+# 700 whatever the caller is. Deleting or sizing the store therefore needs sudo
+# on any machine where the runner is not root -- which is all of them.
+_rm_store() { [ -n "${1:-}" ] || return 0; rm -rf "${1:?}" 2>/dev/null || sudo rm -rf "${1:?}"; }
+_du_store() { sudo du -sh "$1" 2>/dev/null | cut -f1 || echo "?"; }
 
 _bc_odata() {
   docker compose exec -T bc curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
@@ -320,7 +330,7 @@ status() {
   if [ "${BC_SNAPSHOT_REFRESH:-}" = "1" ]; then echo "refresh forced $s"; return 1; fi
   # The stamp is written LAST by create(), so its presence is what distinguishes
   # a complete pair from one interrupted halfway. A torn snapshot is a miss.
-  if [ -f "$s/$STAMP_NAME" ] && [ -f "$s/cronus.bak" ] && [ -d "$s/checkpoint" ]; then
+  if [ -f "$s/$STAMP_NAME" ] && [ -s "$s/cronus.bak" ] && [ -d "$s/checkpoint/cp1" ]; then
     echo "hit $s"; return 0
   fi
   echo "miss $s"; return 1
@@ -340,7 +350,7 @@ create() {
   [ -n "$cid" ] || die "no running bc container"
   [ "$(_bc_odata)" = "200" ] || die "bc is not serving OData — refusing to snapshot a BC that is not healthy"
 
-  rm -rf "$s"; mkdir -p "$s/checkpoint"
+  _rm_store "$s"; mkdir -p "$s/checkpoint"
   CREATE_STORE="$s"
   # From the checkpoint onwards bc is STOPPED, so every later failure has to put
   # it back. Without this a backup error leaves the caller with no BC at all and
@@ -369,17 +379,22 @@ create() {
     echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "service_stamp=$(_service_volume_stamp)"
   } > "$s/$STAMP_NAME"
-  log "snapshot stored in $s ($(du -sh "$s" | cut -f1))"
+  log "snapshot stored in $s ($(_du_store "$s"))"
 
   # --leave-running=false left bc STOPPED, and `docker compose start bc` would
   # run the entrypoint and cold-boot it all over again. Resume from the
   # checkpoint we just took instead: the caller asked for a snapshot, not for
   # their BC to be taken away.
-  if docker start --checkpoint-dir "$s/checkpoint" --checkpoint cp1 "$cid" 2>/dev/null; then
+  if docker start --checkpoint-dir "$s/checkpoint" --checkpoint cp1 "$cid" 2>/tmp/snapshot-resume.err; then
     _mark_ready
     log "bc resumed from the checkpoint it just wrote"
   else
+    # Never swallow this. A resume that fails silently looks identical to one
+    # that was never attempted, and it is the same code path restore() uses --
+    # so whatever breaks here breaks the feature, not just this convenience.
     log "could not resume from the fresh checkpoint — cold booting so the caller is not left without a BC"
+    sed -n 1,5p /tmp/snapshot-resume.err >&2 || true
+    sudo grep -E "Error \\(|killed by signal" /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
     docker compose up -d --wait
   fi
   trap - EXIT
@@ -485,7 +500,7 @@ restore() {
 _discard() {
   log "discarding snapshot ($2): $1"
   docker compose rm -sf bc >/dev/null 2>&1 || true
-  rm -rf "${1:?}"
+  _rm_store "$1"
 }
 
 case "${1:-}" in

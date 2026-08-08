@@ -126,6 +126,12 @@ if ! ./scripts/snapshot.sh status >/dev/null 2>&1; then
   say "re-seeding the snapshot (the cold rung invalidated it)"
   docker compose up -d >/dev/null 2>&1 && wait_odata && ./scripts/snapshot.sh create
 fi
+# Keep the snapshot even when a restore fails. Without this, iteration 1's
+# failure deletes the store and iterations 2 and 3 report "no snapshot for this
+# key" — three FAILs describing one event, and no second look at the real one.
+# A benchmark is exactly the place to observe a failure repeatedly; the
+# production default (discard) stays untouched.
+export BC_SNAPSHOT_KEEP_ON_FAIL=1
 run_rung "restore (snapshot mode)" snap_restore
 
 say "results — seconds to OData 200"

@@ -446,8 +446,20 @@ _odata_diagnosis() {
   log "  bc container: $(docker compose ps --format '{{.Name}} {{.State}} {{.Health}}' bc 2>/dev/null | head -1)"
   log "  host port 7048: $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
         -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company 2>/dev/null || echo unreachable)"
-  log "  --- bc log tail ---"
-  docker compose logs bc --tail 12 2>&1 | cut -c1-160 >&2 || true
+  # BC writes multi-line diagnostic blocks -- a stack trace, then ProcessId,
+  # Tag, ThreadId, CounterInformation and so on. A plain `--tail 12` therefore
+  # lands in the MIDDLE of one and shows nothing but frame lines and empty
+  # fields, which is exactly what run 16's failure produced. Pull the lines
+  # that carry meaning out of a much larger window instead.
+  log "  --- bc: most recent error lines ---"
+  docker compose logs bc --tail 400 2>&1 \
+    | grep -aE 'Exception|Message:|Server instance|tenant|Tenant|SQL|login|Login|refus|denied|Unable|Failed|failed' \
+    | grep -avE '^\s*at |_Async_Internals_' \
+    | tail -15 | cut -c1-200 >&2 || true
+  # Whether the restored process is even alive separates "criu put it back and
+  # it then died" from "it is up but not serving", which have nothing in common.
+  log "  bc main process: $(docker compose exec -T bc sh -c 'ps -o comm= -p 1 2>/dev/null; pgrep -c dotnet 2>/dev/null' 2>/dev/null | tr '\n' ' ' || echo 'exec failed')"
+  log "  sql: $(docker compose ps --format '{{.State}} {{.Health}}' sql 2>/dev/null | head -1)"
 }
 
 # ─── docker will not restore from a custom checkpoint directory ───────────────
@@ -828,6 +840,14 @@ restore() {
   if [ "$(_bc_odata)" != "200" ]; then
     log "restored bc never served OData — cold boot"
     _odata_diagnosis
+    # criu returning 0 does not mean it restored everything cleanly: sockets and
+    # file locks it could not put back are WARNINGS, not a non-zero exit. When
+    # the process is alive but not serving, that is the first place to look, and
+    # run 16 threw this log away because the restore had "succeeded".
+    if [ -s /var/tmp/criu-work/criu.log ]; then
+      log "  --- criu restore log (warnings and errors) ---"
+      grep -aE "Error \(|Warn \(" /var/tmp/criu-work/criu.log | tail -15 >&2 || true
+    fi
     _discard "$s" "restored bc did not serve OData"
     return 1
   fi
@@ -839,8 +859,18 @@ restore() {
 # A snapshot that failed to restore will fail again the same way, and leaving it
 # turns one bad run into every subsequent run.
 _discard() {
-  log "discarding snapshot ($2): $1"
   docker compose rm -sf bc >/dev/null 2>&1 || true
+  # Discarding is right in production: a snapshot that failed to restore will
+  # fail the same way next time, and keeping it turns one bad run into every
+  # run. It is wrong while DIAGNOSING a restore failure -- run 16 lost
+  # iterations 2 and 3 to "no snapshot for this key" after iteration 1 failed,
+  # so one failure was observed once instead of three times and the re-seed
+  # cost 100s. bench-snapshot.sh sets this; nothing else should.
+  if [ "${BC_SNAPSHOT_KEEP_ON_FAIL:-}" = "1" ]; then
+    log "keeping the snapshot despite failure ($2) — BC_SNAPSHOT_KEEP_ON_FAIL=1"
+    return 0
+  fi
+  log "discarding snapshot ($2): $1"
   _rm_store "$1"
 }
 

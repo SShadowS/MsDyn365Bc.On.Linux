@@ -58,11 +58,10 @@ wait_odata() {
   return 1
 }
 
-time_it() {  # time_it <command...> -> seconds, or FAIL
-  local t0; t0=$(date +%s)
-  if "$@" >/dev/null 2>&1 && wait_odata; then echo $(( $(date +%s) - t0 ))
-  else echo "FAIL"; fi
-}
+# NOTE: there is deliberately no output-swallowing helper here any more. The
+# first version ran the timed command as `"$@" >/dev/null 2>&1`, which threw
+# away both the per-phase timings this benchmark exists to collect AND the
+# reason any failed iteration failed. run_rung keeps a per-iteration log.
 
 cold_boot()    { docker compose down -v --remove-orphans; docker compose up -d; }
 warm_boot()    { docker compose down --remove-orphans;    docker compose up -d; }
@@ -91,11 +90,22 @@ fi
 RESULTS=$(mktemp); trap 'rm -f "$RESULTS"' EXIT
 
 run_rung() {  # run_rung <name> <fn>
-  local name=$1 fn=$2 i r vals=""
+  local name=$1 fn=$2 i r t0 lg vals=""
   say "$name  (n=$ITERATIONS)"
   for i in $(seq 1 "$ITERATIONS"); do
-    r=$(time_it "$fn")
+    lg=$(mktemp)
+    t0=$(date +%s)
+    if "$fn" >"$lg" 2>&1 && wait_odata; then r=$(( $(date +%s) - t0 )); else r=FAIL; fi
     printf '  iteration %d: %ss\n' "$i" "$r"
+    # The phase breakdown is in this output, and so is the explanation of a
+    # failure. Both were being discarded.
+    grep -aE '\[snapshot\] (sql up|checkpoint staged|criu restore|restored and serving)' "$lg" \
+      | sed 's/^/      /' || true
+    if [ "$r" = FAIL ]; then
+      echo "      ---- why it failed (last 15 lines) ----"
+      tail -15 "$lg" | sed 's/^/      /'
+    fi
+    rm -f "$lg"
     vals="$vals $r"
   done
   printf '%s\t%s\n' "$name" "${vals# }" >> "$RESULTS"

@@ -52,6 +52,13 @@ def main() -> int:
     print("  The first rung is the baseline. Quote the ratio AND the spread — a")
     print("  single pair of runs proved misleading more than once while building")
     print("  this; see docs/SNAPSHOT.md, 'Measurements'.")
+
+    # A run where iterations failed is not a result, and must not leave CI green.
+    # Run 7 reported "1.2x faster (2 failed)" inside a job that exited 0.
+    failed = sum(f for _, _, f in rows)
+    if failed:
+        print(f"\n  {failed} iteration(s) FAILED — these medians are not trustworthy.")
+        return 1
     return 0
 
 

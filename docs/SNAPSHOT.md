@@ -393,31 +393,35 @@ itself, measured from inside `snapshot.sh`, is **37s** of that 61s.
 
 Sweep of four GC configurations, all in one job (`scripts/bench-criu-gc.sh`):
 
-| configuration | vmas | checkpoint | criu | restore total |
-|---|---|---|---|---|
-| baseline (Server GC, heaps = ncpu) | 5,526 | 2.3 GB | 19s | 23s |
-| **Server GC, `DOTNET_GCHeapCount=2`** | 5,146 | **1.4 GB** | **13s** | **15s** |
-| Server GC, `DOTNET_GCHeapCount=1` | 4,959 | 1.4 GB | 12s | 15s |
-| Workstation GC (`DOTNET_gcServer=0`) | 5,489 | 2.2 GB | — | **every restore failed** |
+| configuration | vmas | checkpoint | boot | criu | restore total |
+|---|---|---|---|---|---|
+| baseline (Server GC, heaps = ncpu) | 5,645 | 3.0 GB | 49s | 26s | 30s |
+| **Server GC, `DOTNET_GCHeapCount=2`** | 5,138 | **1.5 GB** | **49s** | **12s** | **16s** |
+| Server GC, `DOTNET_GCHeapCount=1` | 4,987 | 1.3 GB | 51s | 11s | 14s |
+| Workstation GC (`DOTNET_gcServer=0`) | 5,544 | 2.0 GB | 49s | 17s | 20s |
 
 **criu time tracks checkpoint BYTES, not mappings.** Fewer heaps commit less
-memory, the checkpoint nearly halves, and the restore follows it almost
-linearly. The mapping count barely moves and is irrelevant — worth stating
-plainly, because `vm.max_map_count >= 2^20` in the setup script makes the NST
-look like it has a huge number of regions. It has about 5,000; the requirement
-is defensive.
+memory, the checkpoint halves, and the restore follows it almost linearly. The
+mapping count barely moves and is irrelevant — worth stating plainly, because
+`vm.max_map_count >= 2^20` in the setup script makes the NST look like it has a
+huge number of regions. It has about 5,000; the requirement is defensive.
 
-Two things not to repeat:
+**Boot does not regress.** This was expected to be a trade — Server GC is the
+default precisely to speed up the parallel Roslyn compile during startup and
+extension publish — and at 2 heaps the trade does not appear: 49s against a 49s
+baseline. One heap costs ~2s. That is the reason the boot column exists.
 
-- **Workstation GC is incompatible with restore.** BC comes back and then
-  answers `NavODataServiceUnavailableException` forever. It is also no smaller
-  than the baseline, so there is no reason to want it.
-- **This is a trade, and the sweep now measures both halves.** Server GC exists
-  to speed up the parallel Roslyn compile during startup and extension publish,
-  so a configuration that restores 7s faster while booting slower has moved the
-  cost rather than removed it. The boot column shows that; test wall clock on a
-  real suite is the measurement that actually settles it, and is not something
-  this repo's smoke test can stand in for.
+What is still unmeasured is **test execution**. Boot is a compile-heavy proxy
+and it is clean, but a long test run is a different workload, and this repo's
+smoke test cannot stand in for a real suite. Measure it before adopting
+`GCHeapCount` anywhere that runs many tests.
+
+Not a finding, despite appearing to be one: an earlier sweep had **every**
+Workstation GC restore fail with `NavODataServiceUnavailableException`, and it
+was briefly written up here as an incompatibility. The next sweep restored it
+3/3. One run in four across this series produced a spurious all-restores-failed
+result for some configuration; treat a single failing sweep as noise and re-run
+before concluding anything from it.
 
 Between-run variance is large enough to mislead: the same baseline measured
 18s, 19s and 25s across three jobs with no code change. Only compare

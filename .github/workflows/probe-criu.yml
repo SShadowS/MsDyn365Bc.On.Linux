@@ -19,11 +19,22 @@
 # restoring against a FRESH SQL container in a later job — is strictly harder.
 # A pass here is necessary, not sufficient. A failure here ends the design.
 #
-# Never runs on push. Dispatch it deliberately; it is a full BC boot plus a
-# checkpoint cycle, several minutes of runner time.
+# It is a full BC boot plus a checkpoint cycle — several minutes of runner
+# time — so it is triggered narrowly: see the `on:` block below.
 name: Probe CRIU checkpoint/restore (diagnostic)
 
+# The push trigger exists so this can run at all right now: workflow_dispatch
+# only registers for workflows on the DEFAULT branch, and this file is on a
+# feature branch. Push has no such rule.
+#
+# Scoped to this branch AND to this file, so it fires when the probe itself
+# changes and not on unrelated pushes — test-versions.yml already demonstrated
+# what an unfiltered trigger costs in this repo. Delete this `push:` block once
+# the probe has told you what you need; it is scaffolding, not a fixture.
 on:
+  push:
+    branches: [claude/hosted-runner-performance-42ljw4]
+    paths: ['.github/workflows/probe-criu.yml']
   workflow_dispatch:
     inputs:
       bc_version:
@@ -53,9 +64,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      BC_VERSION: ${{ inputs.bc_version }}
-      BC_COUNTRY: ${{ inputs.bc_country }}
+      # `inputs.*` is empty when this runs from the push trigger, so each one
+      # falls back to the same default declared above.
+      BC_VERSION: ${{ inputs.bc_version || '28.1' }}
+      BC_COUNTRY: ${{ inputs.bc_country || 'w1' }}
       BC_TYPE: sandbox
+      # Default TRUE on push: the strict check is the point of the probe, and a
+      # boot check alone is not evidence (see Patch #30).
+      VERIFY_PUBLISH: ${{ github.event_name != 'workflow_dispatch' && 'true' || inputs.verify_publish }}
       BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache
 
     steps:
@@ -198,7 +214,7 @@ jobs:
       # ── The strict pass condition ─────────────────────────────────────────
       - name: Compile and publish a NOVEL app after restore
         id: publish
-        if: ${{ inputs.verify_publish }}
+        if: ${{ env.VERIFY_PUBLISH == 'true' }}
         continue-on-error: true
         run: |
           set -e
@@ -253,7 +269,7 @@ jobs:
             echo "::error::BC did not come back from the checkpoint — the design is dead as specified"
             exit 1
           fi
-          if [ "${{ inputs.verify_publish }}" = "true" ] && [ "${{ steps.publish.outcome }}" != "success" ]; then
+          if [ "$VERIFY_PUBLISH" = "true" ] && [ "${{ steps.publish.outcome }}" != "success" ]; then
             echo "::error::BC restored and served OData but a novel app would not publish — tenant did not survive"
             exit 1
           fi

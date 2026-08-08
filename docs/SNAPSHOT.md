@@ -389,6 +389,40 @@ is the baseline: this box boots BC in 73s, so there is far less startup to skip.
 Both rungs include a `docker compose down`, so they are comparable; the restore
 itself, measured from inside `snapshot.sh`, is **37s** of that 61s.
 
+#### `DOTNET_GCHeapCount` is the lever on the restore
+
+Sweep of four GC configurations, all in one job (`scripts/bench-criu-gc.sh`):
+
+| configuration | vmas | checkpoint | criu | restore total |
+|---|---|---|---|---|
+| baseline (Server GC, heaps = ncpu) | 5,526 | 2.3 GB | 19s | 23s |
+| **Server GC, `DOTNET_GCHeapCount=2`** | 5,146 | **1.4 GB** | **13s** | **15s** |
+| Server GC, `DOTNET_GCHeapCount=1` | 4,959 | 1.4 GB | 12s | 15s |
+| Workstation GC (`DOTNET_gcServer=0`) | 5,489 | 2.2 GB | — | **every restore failed** |
+
+**criu time tracks checkpoint BYTES, not mappings.** Fewer heaps commit less
+memory, the checkpoint nearly halves, and the restore follows it almost
+linearly. The mapping count barely moves and is irrelevant — worth stating
+plainly, because `vm.max_map_count >= 2^20` in the setup script makes the NST
+look like it has a huge number of regions. It has about 5,000; the requirement
+is defensive.
+
+Two things not to repeat:
+
+- **Workstation GC is incompatible with restore.** BC comes back and then
+  answers `NavODataServiceUnavailableException` forever. It is also no smaller
+  than the baseline, so there is no reason to want it.
+- **This is a trade, and the sweep now measures both halves.** Server GC exists
+  to speed up the parallel Roslyn compile during startup and extension publish,
+  so a configuration that restores 7s faster while booting slower has moved the
+  cost rather than removed it. The boot column shows that; test wall clock on a
+  real suite is the measurement that actually settles it, and is not something
+  this repo's smoke test can stand in for.
+
+Between-run variance is large enough to mislead: the same baseline measured
+18s, 19s and 25s across three jobs with no code change. Only compare
+configurations **within one job**.
+
 #### Where the 37s goes
 
 | phase | time |

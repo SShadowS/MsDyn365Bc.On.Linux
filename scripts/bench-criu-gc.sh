@@ -80,17 +80,26 @@ for entry in "${CONFIGS[@]}"; do
   echo "  env: ${envs:-<none>}"
 
   docker compose down --remove-orphans >/dev/null 2>&1 || true
+  # Time the boot too. Fewer GC heaps shrink the checkpoint and the restore,
+  # but Server GC is the default because it speeds up the parallel Roslyn
+  # compile during startup and extension publish -- so a configuration that
+  # restores 7s faster and boots 30s slower is not obviously a win. This is the
+  # cheap proxy for that trade; the real one is test wall clock on a real suite.
+  t_boot=$(date +%s)
   if ! docker compose up -d >/dev/null 2>&1 || ! wait_odata; then
     echo "  BOOT FAILED — skipping this configuration" >&2
-    printf '%s\tBOOT-FAIL\t-\t-\n' "$label" >> "$RESULTS"
+    printf '%s\tBOOT-FAIL\t-\t-\t-\t-\n' "$label" >> "$RESULTS"
     continue
   fi
+
+  boot=$(( $(date +%s) - t_boot ))
+  printf '  boot to OData: %ss\n' "$boot"
 
   # create logs the mapping count and the checkpoint's shape; keep them, they
   # are the independent variable this whole sweep is about.
   cr=$(./scripts/snapshot.sh create 2>&1) || {
     echo "  CREATE FAILED" >&2
-    printf '%s\tCREATE-FAIL\t-\t-\n' "$label" >> "$RESULTS"
+    printf '%s\tCREATE-FAIL\t-\t-\t-\t-\n' "$label" >> "$RESULTS"
     printf '%s\n' "$cr" | tail -20 >&2
     continue
   }
@@ -127,7 +136,7 @@ for entry in "${CONFIGS[@]}"; do
   # not the variable (they moved 5614 -> 5033 while the checkpoint went
   # 2.9G -> 1.3G), so the bytes are what the table has to show.
   csz=$(printf '%s\n' "$ckpt" | sed -n 's/.*, \([0-9.]*[MG]\) total.*/\1/p')
-  printf '%s\t%s\t%s\t%s\t%s\n' "$label" "${vmas:-?}" "${csz:-?}" "${criu_times# }" "${total_times# }" >> "$RESULTS"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "${vmas:-?}" "${csz:-?}" "$boot" "${criu_times# }" "${total_times# }" >> "$RESULTS"
 
   # One store at a time: four configurations would otherwise leave ~13 GB behind.
   ./scripts/snapshot.sh discard >/dev/null 2>&1 || true
@@ -137,26 +146,31 @@ log "results"
 python3 - "$RESULTS" <<'PY'
 import statistics, sys
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if l.strip()]
-print(f"  {'configuration':<32}{'vmas':>8}{'ckpt':>8}{'criu':>8}{'total':>8}")
-base = None
+print(f"  {'configuration':<32}{'vmas':>8}{'ckpt':>8}{'boot':>7}{'criu':>7}{'total':>7}")
+base = bootbase = None
 for r in rows:
-    label, vmas, csz = r[0], r[1], r[2]
+    label, vmas, csz, boot = r[0], r[1], r[2], r[3]
     if vmas in ("BOOT-FAIL", "CREATE-FAIL"):
         print(f"  {label:<32}{vmas:>8}"); continue
     def med(s):
         v = [int(x) for x in s.split() if x.isdigit()]
         return statistics.median(v) if v else None
-    c, t = med(r[3]), med(r[4])
+    c, t = med(r[4]), med(r[5])
     if c is None:
-        print(f"  {label:<32}{vmas:>8}{csz:>8}{'ALL RESTORES FAILED':>20}"); continue
+        print(f"  {label:<32}{vmas:>8}{csz:>8}{boot:>6}s{'ALL RESTORES FAILED':>22}"); continue
     rel = ""
     if base is None:
-        base = c
-    elif c < base:
-        rel = f"   criu {base - c:.0f}s faster"
-    elif c > base:
-        rel = f"   criu {c - base:.0f}s SLOWER"
-    print(f"  {label:<32}{vmas:>8}{csz:>8}{c:>7.0f}s{(t or 0):>7.0f}s{rel}")
+        base, bootbase = c, int(boot)
+    else:
+        # Both directions, because this is a trade: a configuration that
+        # restores faster while booting slower has moved the cost, not removed
+        # it. Boot is where the parallel Roslyn compile lives.
+        dr = base - c
+        db = int(boot) - bootbase
+        rel = f"   criu {abs(dr):.0f}s {'faster' if dr > 0 else 'SLOWER'}"
+        if db:
+            rel += f", boot {abs(db)}s {'slower' if db > 0 else 'faster'}"
+    print(f"  {label:<32}{vmas:>8}{csz:>8}{boot:>6}s{c:>6.0f}s{(t or 0):>6.0f}s{rel}")
 print()
 print("  ckpt is the variable that moves: the first sweep saw mappings go")
 print("  5614 -> 5033 (nothing) while the checkpoint went 2.9G -> 1.3G. So the")

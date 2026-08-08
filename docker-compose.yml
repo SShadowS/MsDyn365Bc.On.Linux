@@ -138,6 +138,10 @@ services:
       DOTNET_ReadyToRun: ${DOTNET_ReadyToRun:-}
       DOTNET_GCRetainVM: ${DOTNET_GCRetainVM:-}
       DOTNET_GCConserveMemory: ${DOTNET_GCConserveMemory:-}
+      # Server GC's per-heap reservations dominate the NST's ~263 GB VmSize,
+      # and criu restore time tracks the NUMBER of mappings rather than bytes —
+      # so these two are the levers on the 18s criu phase of a snapshot restore.
+      DOTNET_gcServer: ${DOTNET_gcServer:-}
       DOTNET_GCHeapCount: ${DOTNET_GCHeapCount:-}
       DOTNET_GCNoAffinitize: ${DOTNET_GCNoAffinitize:-}
     volumes:

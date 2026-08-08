@@ -1096,7 +1096,12 @@ mkfifo /tmp/bc-stdin 2>/dev/null || true
 # - Server GC: better throughput for multi-threaded workloads (extension compilation)
 # - Tiered compilation: DISABLED to prevent JMP hooks from being overwritten by Tier 1 recompilation.
 #   The Watson crash handler patch relies on JMP hooks staying in place.
-export DOTNET_gcServer=1
+# Overridable for the same reason TieredCompilation is: an unconditional export
+# makes the docker-compose passthrough silently dead. Server GC remains the
+# default and is what every non-experimental path gets. It matters for snapshot
+# mode because Server GC reserves per-heap reservations that dominate the NST's
+# ~263 GB VmSize, and criu restore time tracks the NUMBER of mappings.
+export DOTNET_gcServer="${DOTNET_gcServer:-1}"
 # Default 0 (JMP-hook safety), but honor a caller override so the
 # docker-compose passthrough is actually usable for A/B experiments —
 # the unconditional export made that knob silently dead.

@@ -1031,6 +1031,7 @@ case "${1:-}" in
   create)    create ;;
   restore)   restore ;;
   reap)      _reap_ctrd_staging; log "reaped containerd checkpoint staging"; _host_tmp_stat | awk '{printf "  daemon /tmp: %s, %d GB free\n", $1, $2/1024}' ;;
+  discard)   s=$(_store) || die "cannot compute a key"; _rm_store "$s"; log "discarded $s" ;;
   *) cat >&2 <<USAGE
 usage: scripts/snapshot.sh <command>
 
@@ -1039,6 +1040,7 @@ usage: scripts/snapshot.sh <command>
   preflight  can this host checkpoint at all
   create     checkpoint a healthy BC + back up its database into the store
   restore    bring BC up from the store; non-zero means "cold boot instead"
+  discard    delete the snapshot for the current key (store + rootfs image)
   reap       delete containerd's leftover checkpoint staging from the daemon's
              /tmp (~2.1 GB each, never cleaned up by docker; on a tmpfs /tmp
              they fill RAM and the ENOSPC surfaces as unrelated failures)

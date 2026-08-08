@@ -1,0 +1,97 @@
+# Does cutting the NST's GC reservations make the criu restore faster?
+#
+# The restore is 22s, 18s of it criu. criu restore time tracks the NUMBER of
+# memory mappings rather than the bytes, and the NST's ~263 GB VmSize is nearly
+# all Server GC per-heap reservation — so this sweep is the test of whether
+# that is the 18s or a red herring.
+#
+# Self-hosted only, for the same reasons as bench-selfhosted.yml: it needs a
+# prepared host and a store that survives. Read-only with respect to the host.
+name: Benchmark criu vs GC configuration (self-hosted)
+
+on:
+  push:
+    branches: [claude/hosted-runner-performance-42ljw4]
+    paths:
+      - '.github/workflows/bench-criu-gc.yml'
+      - 'scripts/bench-criu-gc.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# SHARED with bench-selfhosted.yml on purpose: both bind BC's ports directly on
+# the host (snapshot mode needs host networking) and drive the same compose
+# project. Two at once would fight over both.
+concurrency:
+  group: bench-selfhosted
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ${{ vars.BENCH_RUNNER && (startsWith(vars.BENCH_RUNNER, '[') && fromJSON(vars.BENCH_RUNNER) || vars.BENCH_RUNNER) || 'self-hosted' }}
+    timeout-minutes: 180
+    env:
+      COMPOSE_FILE: docker-compose.yml:docker-compose.snapshot.yml
+      BC_VERSION: ${{ vars.BENCH_BC_VERSION || '28.1' }}
+      BC_COUNTRY: w1
+      BC_TYPE: sandbox
+      BC_ARTIFACTS_DIR: /var/cache/bc-linux/artifacts
+      ITERATIONS: ${{ vars.BENCH_ITERATIONS || '3' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is this machine prepared
+        run: |
+          set -e
+          ./scripts/setup-snapshot-host.sh --check || true
+          ./scripts/snapshot.sh preflight || {
+            echo "::error::machine not prepared — run scripts/setup-snapshot-host.sh on it once"
+            exit 1
+          }
+
+      - name: Artifacts
+        run: |
+          set -e
+          [ -w "$BC_ARTIFACTS_DIR" ] || {
+            echo "::error::$BC_ARTIFACTS_DIR is not writable — run scripts/setup-snapshot-host.sh once"
+            exit 1
+          }
+          bash scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$BC_ARTIFACTS_DIR"
+
+      - name: Sweep
+        run: |
+          set -o pipefail
+          # Reap first: containerd leaks ~2.1 GB of checkpoint staging into the
+          # daemon's /tmp, which is a 16 GB tmpfs on this machine. Four
+          # configurations boot and checkpoint in sequence, so starting with a
+          # full ramdisk is the difference between a result and four ENOSPCs
+          # wearing other costumes.
+          ./scripts/snapshot.sh reap || true
+          ./scripts/bench-criu-gc.sh -n "$ITERATIONS" 2>&1 | tee gc.out
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## criu vs GC configuration on \`$(hostname)\`"
+            echo
+            echo '```'
+            sed -n '/^== machine/,/^$/p' gc.out 2>/dev/null || true
+            sed -n '/^== results/,$p'   gc.out 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criu-gc-sweep
+          path: gc.out
+          if-no-files-found: warn
+
+      - name: Leave the machine idle
+        if: always()
+        run: |
+          docker compose down --remove-orphans || true
+          ./scripts/snapshot.sh reap || true

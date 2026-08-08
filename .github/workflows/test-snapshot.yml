@@ -69,12 +69,10 @@ jobs:
       # Must be a HOST directory: snapshot.sh keys on the resolved artifact urls
       # in its stamp, which is not readable from inside a named volume.
       BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache
-      # Only pinned on a hosted runner, where nothing survives anyway. On a real
-      # machine this is left UNSET on purpose so scripts/snapshot.sh resolves the
-      # machine-level store (/var/cache/bc-linux/snapshots or ~/.cache/...) —
-      # which is what makes the snapshot outlive the job, and exercises the
-      # per-machine opt-in rather than bypassing it.
-      BC_SNAPSHOT_DIR: ${{ runner.environment == 'github-hosted' && format('{0}/snapshot-store', github.workspace) || '' }}
+      # BC_SNAPSHOT_DIR is chosen in a STEP, not here: the `runner` context is
+      # not available in job-level env, and referencing it made the whole
+      # workflow unparseable — zero jobs, a run named after the file path, and
+      # no error attributable to any step.
       BC_SNAPSHOT_SQLDIR: /tmp/sqlsnap
       COMPOSE_FILE: docker-compose.yml:docker-compose.snapshot.yml
       # 3.17 (what jammy packages) dumps BC perfectly and segfaults the restored
@@ -84,6 +82,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Hosted runners are discarded, so the store may as well live in the
+      # workspace. On a real machine it is left unset so snapshot.sh resolves the
+      # machine-level store — which is what lets a snapshot outlive the job, and
+      # exercises the per-machine opt-in rather than bypassing it.
+      - name: Choose the snapshot store
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "BC_SNAPSHOT_DIR=${{ github.workspace }}/snapshot-store" >> "$GITHUB_ENV"
+            echo "hosted runner: store in the workspace"
+          else
+            echo "self-hosted: using this machine's own store"
+          fi
 
       # The key must behave before anything expensive runs: it is the whole
       # safety story, and it needs no docker daemon and no BC.
@@ -132,36 +143,17 @@ jobs:
           fi
           echo "setup=needed" >> "$GITHUB_OUTPUT"
 
-      - name: Install criu and enable docker experimental (ephemeral runners only)
+      # setup-snapshot-host.sh rather than an inline copy of it: since the run
+      # path stopped applying sysctls and writing /etc/criu/runc.conf on every
+      # invocation, SOMETHING has to do it once, and duplicating that here is how
+      # the two drift apart. --yes because there is nobody to prompt, and it is
+      # only ever reached on a runner that gets discarded.
+      - name: Prepare this ephemeral runner
         if: steps.hostcap.outputs.setup == 'needed'
         run: |
           set -e
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential git pkg-config \
-            libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
-            python3-protobuf libnl-3-dev libnet-dev libcap-dev libbsd-dev \
-            libgnutls28-dev libnftables-dev iproute2
-          git clone --depth 1 --branch "$CRIU_REF" https://github.com/checkpoint-restore/criu.git /tmp/criu
-          make -C /tmp/criu -j"$(nproc)" 2>&1 | tail -5
-          sudo make -C /tmp/criu install-criu
-          command -v criu || sudo ln -sf /usr/local/sbin/criu /usr/sbin/criu
-          criu --version
-          # Hard gate: this reported exit 1 on the 6.17 kernel and the run went
-          # on to boot BC for two minutes before failing for that same reason.
-          # Exit code, not a grep: "Warn (criu/kerndat.c): Can't load
-          # /run/criu.kdat" is printed on every first run and means nothing.
-          if ! sudo criu check 2>&1 | tee criu-check.out; then
-            echo "::error::criu check failed on kernel $(uname -r)"
-            grep -E '^(Error|Warn)' criu-check.out | tail -8
-            exit 1
-          fi
-          # MERGE, never replace. Even on a throwaway VM the runner image ships a
-          # daemon.json, and clobbering it is a habit that eventually runs
-          # somewhere it matters.
-          sudo test -f /etc/docker/daemon.json || echo '{}' | sudo tee /etc/docker/daemon.json >/dev/null
-          sudo python3 -c "import json; p='/etc/docker/daemon.json'; cfg=json.load(open(p)); cfg['experimental']=True; json.dump(cfg, open(p,'w'), indent=2); print('daemon.json now:', cfg)"
-          sudo systemctl restart docker
-          for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          ./scripts/setup-snapshot-host.sh --yes --store "${BC_SNAPSHOT_DIR:-$GITHUB_WORKSPACE/snapshot-store}"
+          ./scripts/snapshot.sh preflight
 
       - name: Fetch BC artifacts and images
         run: |

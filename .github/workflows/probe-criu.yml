@@ -1,0 +1,245 @@
+# Diagnostic probe: can a booted BC service tier survive CRIU checkpoint/restore?
+#
+# WHY THIS EXISTS
+# ---------------
+# With the caches described in CLAUDE.md, a warm boot is ~90s and ~80s of that
+# is NST startup. Tiering and skipping Merkle validation were both measured and
+# rejected (see PERFORMANCE-IDEAS.md), so the only remaining lever on that 80s
+# is to not run startup at all: checkpoint a booted NST and restore the image.
+#
+# WHAT THIS PROVES, AND WHAT IT DOES NOT
+# --------------------------------------
+# This runs on a GitHub-hosted runner, which is ephemeral — so it CANNOT show
+# the wall-clock win, which only exists on a runner that keeps the checkpoint
+# between jobs. It tests the prerequisite: does BC come back alive at all.
+#
+# It also tests the EASY variant. Restore happens in the same job against the
+# SAME still-running SQL container, so the ~17 pooled TCP connections have a
+# live peer with matching sequence numbers. The case that actually matters —
+# restoring against a FRESH SQL container in a later job — is strictly harder.
+# A pass here is necessary, not sufficient. A failure here ends the design.
+#
+# Never runs on push. Dispatch it deliberately; it is a full BC boot plus a
+# checkpoint cycle, several minutes of runner time.
+name: Probe CRIU checkpoint/restore (diagnostic)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bc_version:
+        description: "BC version to boot"
+        required: false
+        type: string
+        default: "28.1"
+      bc_country:
+        description: "BC country"
+        required: false
+        type: string
+        default: "w1"
+      verify_publish:
+        description: >
+          After restore, compile and publish a NOVEL app to prove the tenant
+          survived. A boot check alone is not a pass — Patch #30 passed one and
+          was still catastrophic. Costs ~2 min.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BC_VERSION: ${{ inputs.bc_version }}
+      BC_COUNTRY: ${{ inputs.bc_country }}
+      BC_TYPE: sandbox
+      BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Gate 1: does the runner kernel support checkpoint/restore? ────────
+      # This is what stopped the probe being run locally: a Firecracker microVM
+      # kernel had CONFIG_CHECKPOINT_RESTORE unset, which makes CRIU impossible
+      # at any privilege level. Stock Ubuntu has it. Verify, don't assume.
+      - name: Kernel + CRIU availability
+        id: gate
+        run: |
+          set +e
+          echo "kernel: $(uname -r)"
+          CFG=/boot/config-$(uname -r)
+          if [ -f "$CFG" ]; then
+            grep -E "^CONFIG_CHECKPOINT_RESTORE|^# CONFIG_CHECKPOINT_RESTORE" "$CFG" || echo "CONFIG_CHECKPOINT_RESTORE: absent from $CFG"
+          else
+            echo "no $CFG on this runner"
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq criu || { echo "::error::criu not installable"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          criu --version
+          echo "--- criu check --all (informational; some features are optional) ---"
+          sudo criu check --all
+          echo "criu check exit: $?"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      # ── Gate 2: docker checkpoint needs the experimental daemon flag ──────
+      - name: Enable docker experimental
+        run: |
+          echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          echo "experimental: $(docker info --format '{{.ExperimentalBuild}}')"
+          docker checkpoint --help >/dev/null 2>&1 \
+            && echo "docker checkpoint: available" \
+            || echo "::warning::docker checkpoint subcommand unavailable"
+
+      - name: Fetch BC artifacts and images
+        run: |
+          set -e
+          mkdir -p "$BC_ARTIFACTS_DIR"
+          bash scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$BC_ARTIFACTS_DIR" &
+          DL=$!
+          bash scripts/compose-pull.sh &
+          PULL=$!
+          wait $DL   || { echo "::error::artifact download failed"; exit 1; }
+          wait $PULL || { echo "::error::image pull failed"; exit 1; }
+
+      - name: Boot BC (cold) and time it
+        id: boot
+        run: |
+          set -e
+          T0=$(date +%s)
+          docker compose up -d --wait
+          T1=$(date +%s)
+          echo "cold_boot=$((T1-T0))" >> "$GITHUB_OUTPUT"
+          echo "cold boot to healthy: $((T1-T0))s"
+          CID=$(docker compose ps -q bc)
+          echo "cid=$CID" >> "$GITHUB_OUTPUT"
+          docker compose exec -T bc sh -c '
+            for p in /proc/[0-9]*; do
+              tr "\0" " " < $p/cmdline 2>/dev/null | grep -q "Nav.Server.dll" && PID=${p#/proc/} && break
+            done
+            awk "/^VmRSS/{printf \"NST RSS: %.2f GB\n\", \$2/1048576}" /proc/$PID/status
+            awk "/^Private_Dirty/{s+=\$2} END{printf \"NST private dirty (checkpoint payload): %.2f GB\n\", s/1048576}" /proc/$PID/smaps'
+
+      # ── The probe itself ──────────────────────────────────────────────────
+      - name: Checkpoint the running container
+        id: checkpoint
+        continue-on-error: true
+        run: |
+          set -e
+          CID="${{ steps.boot.outputs.cid }}"
+          T0=$(date +%s)
+          docker checkpoint create --leave-running=false "$CID" cp1
+          T1=$(date +%s)
+          echo "checkpoint_s=$((T1-T0))" >> "$GITHUB_OUTPUT"
+          echo "checkpoint took $((T1-T0))s"
+          sudo du -sh "/var/lib/docker/containers/$CID/checkpoints/cp1" 2>/dev/null \
+            || sudo find /var/lib/docker -maxdepth 6 -name cp1 -type d -exec du -sh {} \; 2>/dev/null \
+            || echo "(checkpoint dir not located — size unknown)"
+
+      - name: Restore from the checkpoint
+        id: restore
+        continue-on-error: true
+        run: |
+          set -e
+          CID="${{ steps.boot.outputs.cid }}"
+          T0=$(date +%s)
+          docker start --checkpoint cp1 "$CID"
+          # Readiness is OData answering, not the container being "up".
+          for i in $(seq 1 180); do
+            code=$(docker compose exec -T bc curl -s -o /dev/null -w '%{http_code}' \
+                     --max-time 5 -u BCRUNNER:Admin123! \
+                     http://localhost:7048/BC/ODataV4/Company 2>/dev/null || echo 000)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          T1=$(date +%s)
+          echo "restore_s=$((T1-T0))" >> "$GITHUB_OUTPUT"
+          echo "odata=$code" >> "$GITHUB_OUTPUT"
+          echo "restore to OData 200: $((T1-T0))s (last code $code)"
+
+      - name: Post-restore health
+        id: health
+        continue-on-error: true
+        run: |
+          set +e
+          echo "container: $(docker inspect --format '{{.State.Status}}' ${{ steps.boot.outputs.cid }})"
+          docker compose exec -T bc curl -s -o /dev/null -w 'OData  /Company : %{http_code}\n' \
+            --max-time 20 -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company
+          docker compose exec -T bc curl -s -o /dev/null -w 'dev    /apps    : %{http_code}\n' \
+            --max-time 20 -u BCRUNNER:Admin123! http://localhost:7049/BC/dev/apps
+          echo "--- did the SQL connection pool survive? ---"
+          docker compose exec -T bc /opt/mssql-tools18/bin/sqlcmd -S sql -U sa -P 'Passw0rd123!' \
+            -C -d CRONUS -h -1 -W -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM [Company];" 2>&1 | head -3
+          echo "--- BC log tail since restore ---"
+          docker compose logs bc --tail 25 2>&1 | cut -c1-160
+
+      # ── The strict pass condition ─────────────────────────────────────────
+      - name: Compile and publish a NOVEL app after restore
+        id: publish
+        if: ${{ inputs.verify_publish }}
+        continue-on-error: true
+        run: |
+          set -e
+          AL_VER=$(python3 scripts/resolve-al-tool-version.py "$BC_VERSION" --policy matching)
+          PKG=microsoft.dynamics.businesscentral.development.tools.linux
+          mkdir -p al && curl -fsSL \
+            "https://api.nuget.org/v3-flatcontainer/${PKG}/${AL_VER}/${PKG}.${AL_VER}.nupkg" -o al/pkg.zip
+          unzip -q -o al/pkg.zip -d al && rm al/pkg.zip
+          ALC=$(find al -type f -name alc | sort | tail -1); chmod +x "$ALC"
+          mkdir -p symbols
+          python3 scripts/stage-symbols.py \
+            --app-json extensions/smoke-test/app.json \
+            --artifact-dir "$BC_ARTIFACTS_DIR" --out-dir symbols
+          "$ALC" /project:"$PWD/extensions/smoke-test" /packagecachepath:"$PWD/symbols" \
+                 /out:"$PWD/smoke-test.app"
+          docker compose cp smoke-test.app bc:/tmp/smoke-test.app
+          docker compose exec -T bc sh -c '
+            code=$(curl -s -o /tmp/p.out -w "%{http_code}" --max-time 300 -u BCRUNNER:Admin123! \
+              -X POST -F "file=@/tmp/smoke-test.app;type=application/octet-stream" \
+              "http://localhost:7049/BC/dev/apps?SchemaUpdateMode=forcesync")
+            echo "publish HTTP $code"; head -c 400 /tmp/p.out; echo
+            [ "$code" = "200" ]'
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verdict
+        if: always()
+        run: |
+          {
+            echo "## CRIU checkpoint/restore probe"
+            echo
+            echo "Runner: $(nproc) vCPU / $(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo) GB, kernel $(uname -r)"
+            echo
+            echo "| step | result |"
+            echo "|---|---|"
+            echo "| cold boot to healthy | ${{ steps.boot.outputs.cold_boot }}s |"
+            echo "| checkpoint | ${{ steps.checkpoint.outcome }} (${{ steps.checkpoint.outputs.checkpoint_s }}s) |"
+            echo "| restore | ${{ steps.restore.outcome }} (${{ steps.restore.outputs.restore_s }}s, OData ${{ steps.restore.outputs.odata }}) |"
+            echo "| post-restore health | ${{ steps.health.outcome }} |"
+            echo "| novel app publish | ${{ steps.publish.outcome }} |"
+            echo
+            echo "This runner is ephemeral, so these timings do NOT show the win —"
+            echo "that only exists where the checkpoint survives between jobs. Restore"
+            echo "here also had the SAME SQL container alive, which is the easy case;"
+            echo "restoring against a fresh SQL container is strictly harder."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.restore.outcome }}" != "success" ] || [ "${{ steps.restore.outputs.odata }}" != "200" ]; then
+            echo "::error::BC did not come back from the checkpoint — the design is dead as specified"
+            exit 1
+          fi
+          if [ "${{ inputs.verify_publish }}" = "true" ] && [ "${{ steps.publish.outcome }}" != "success" ]; then
+            echo "::error::BC restored and served OData but a novel app would not publish — tenant did not survive"
+            exit 1
+          fi
+          echo "Restore verified. Next question is the hard one: restoring against a FRESH SQL container."
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker compose logs bc --tail 120 2>&1 | cut -c1-200 || true
+          sudo dmesg | tail -40 || true
+          sudo ls -la /var/log/criu* 2>/dev/null || true

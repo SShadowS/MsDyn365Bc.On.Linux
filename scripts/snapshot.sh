@@ -150,6 +150,15 @@ MSG
 #   the app    BC_KEEP_APP_IDS is a comma list whose ORDER is not meaningful, so
 #   variables  hashing it raw made "aaa,bbb" and "bbb,aaa" different keys for an
 #              identical snapshot. apps= carries them sorted and deduped.
+#   volume    the HOST side of every mount is normalised away, keeping the
+#   sources   target and mode. What the checkpoint depends on is what BC sees
+#             at /bc/artifacts, not which directory on this machine was mounted
+#             there — and the artifact CONTENTS are keyed by artifact=, the
+#             license by license=, and the service volume is checked against its
+#             own stamp at restore time. Without this, two repositories on one
+#             runner get different keys purely because each passes its own
+#             ${{ github.workspace }}/artifact-cache, and each rebuilds a 2.6 GB
+#             snapshot the other could have used.
 _config_fp() {
   _compose_json | python3 -c '
 import sys, json, hashlib
@@ -157,6 +166,9 @@ bc = json.load(sys.stdin)["services"]["bc"]
 bc.pop("build", None)
 for k in ("BC_KEEP_APP_IDS", "BC_CLEAR_ALL_APPS", "BC_TEST_APPS"):
     bc.get("environment", {}).pop(k, None)
+for v in bc.get("volumes", []):
+    if isinstance(v, dict):
+        v["source"] = "<host>"
 print(hashlib.sha256(json.dumps(bc, sort_keys=True).encode()).hexdigest()[:16])'
 }
 

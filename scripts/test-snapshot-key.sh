@@ -12,7 +12,7 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d); TMP2=$(mktemp -d); trap 'rm -rf "$TMP" "$TMP2"' EXIT
 printf 'key=v1|https://x/sandbox/28.1.49838.53507/w1|https://x/sandbox/28.1.49838.53507/platform\n' \
   > "$TMP/.bc-artifact-cache"
 
@@ -44,6 +44,18 @@ echo "snapshot key behaviour:"
 check stable "keep-app-ids reordered"          BC_KEEP_APP_IDS=bbb,aaa
 check stable "keep-app-ids duplicated"         BC_KEEP_APP_IDS=aaa,bbb,aaa
 check stable "unrelated variable in the shell" BC_KEEP_APP_IDS=aaa,bbb SOME_UNRELATED_VAR=1
+
+# The whole point of sharing a snapshot between two apps, or two repositories,
+# on one runner. Each repo passes its own ${{ github.workspace }}/artifact-cache,
+# and if that host path reached the key they would each rebuild a 2.6 GB
+# snapshot the other could have used. Only the artifact CONTENT may matter.
+cp "$TMP/.bc-artifact-cache" "$TMP2/.bc-artifact-cache"
+check stable "a different artifact-cache host path" BC_KEEP_APP_IDS=aaa,bbb BC_ARTIFACTS_DIR="$TMP2"
+
+# An app's own identity is not in the key: resolve-keep-app-ids.py seeds from
+# declared DEPENDENCIES and never from the app's own id, so two different apps
+# with the same closure produce the same BC_KEEP_APP_IDS and share a snapshot.
+# This asserts the key end of that; the resolver end is its own concern.
 
 # Must invalidate — each changes what is actually inside the checkpoint or the
 # database it is paired with.

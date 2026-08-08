@@ -141,7 +141,8 @@ invalidate), `BC_CLEAR_ALL_APPS`, and the **contents** of `BC_TEST_APPS` if set.
 
 `BC_KEEP_APP_IDS` is your app's transitive dependency closure, so it moves when
 your dependencies move and **not** on every commit. That is what makes any of
-this cacheable.
+this cacheable — and it is also why one snapshot serves many different apps;
+see below.
 
 ### `config` — how BC was launched
 
@@ -168,6 +169,42 @@ packages — dumps BC perfectly and then segfaults the restored process, so
 `preflight` rejects it outright.
 
 ---
+
+## One snapshot, many apps
+
+**Yes — two different apps share a snapshot as long as their dependency closures
+match.** This is the design, not a lucky accident: a snapshot is taken *before*
+any consumer app is published, so what it contains is Microsoft's apps, the test
+framework, and the TestRunnerExtension. Your code is never in it.
+
+Concretely, `resolve-keep-app-ids.py` seeds the closure from the app's declared
+`dependencies` and **never from the app's own `id`**. So an app's identity,
+name, publisher and version do not reach `BC_KEEP_APP_IDS`, and therefore do not
+reach the key:
+
+| two apps differing in | shares a snapshot |
+|---|---|
+| id, name, publisher, version | yes |
+| source code, objects, translations | yes |
+| the `platform` / `application` version values | yes (their presence is what seeds, not their value) |
+| a dependency added, removed or swapped | **no** — different closure |
+
+It holds **across repositories** on the same machine too. The store is per
+machine and keyed only on the components above, so two unrelated products with
+the same closure use the same snapshot, and the second one to run gets a hit it
+did nothing to earn. The host path of each repo's artifact cache is deliberately
+normalised out of `config` for exactly this reason — otherwise each repo's
+`${{ github.workspace }}/artifact-cache` would give it a private key and its own
+2.6 GB copy.
+
+Two things break the sharing, both avoidable:
+
+- **`BC_TEST_APPS`.** It bakes the named apps into the snapshot, so their
+  contents are part of the key and every rebuild of your app is a new snapshot.
+  Publish after restore with `scripts/publish-app.sh` instead.
+- **Anything else in the key differing between the two pipelines** — most often
+  a different BC version pin, a different runner image tag, or a different
+  license. Align those and the sharing follows.
 
 ## Keeping a snapshot valid for as long as possible
 

@@ -330,31 +330,47 @@ same way the warm service tier and warm artifact cache are.
 
 ## Measurements
 
-GitHub-hosted `ubuntu-22.04`, 4 vCPU, BC 28.1, criu 4.2.1 — the whole feature
-through `scripts/snapshot.sh`, with the containers **removed** between create
-and restore:
+GitHub-hosted `ubuntu-22.04`, 4 vCPU, BC 28.1 `w1`, criu 4.2.1 — the whole
+feature through `scripts/snapshot.sh`, with the containers **removed** between
+create and restore and the database reloaded into a **fresh** SQL container.
+Four runs:
 
-| | |
-|---|---|
-| cold boot to healthy | 135s |
-| create (checkpoint 43s + commit + backup + copy + resume) | ~110s, once |
-| **restore, containers gone** | **47s** |
-| OData `/Company` after restore | 200 |
-| novel app compiled after restore and published | 200 |
-| store on disk | 2.7 GB |
+| | n | mean | range |
+|---|---|---|---|
+| cold boot to BC serving OData | 4 | **130s** | 108-143s |
+| **restore to BC serving OData** | 4 | **47s** | 43-50s |
+| create, paid once per key | 4 | ~110s | checkpoint alone 43-56s |
 
-**~88s saved per run**, and the last two rows are the ones that matter: an app
-that did not exist when the snapshot was taken compiles and publishes into the
-restored tenant, so it is genuinely functional rather than merely answering. A
-boot check alone is not evidence — `StartupHook`'s reverted Patch #30 passed one
-and was catastrophic.
+**~85s saved per run, roughly 3x.** Both figures are *container up → OData 200*;
+they do not include artifact fetch, AL compile, app publish or tests.
+
+Two honesty notes on those numbers:
+
+- **The cold-boot spread is wide** (108-143s, stdev ~14) and is runner variance,
+  not anything this repo controls. Quote the ratio, not a single pair.
+- **The restore is far more stable than the boot it replaces** (43-50s), which
+  is itself part of the value: it removes the most variable phase of the job.
+
+The check that matters is not in the table: after every restore, an app that did
+not exist when the snapshot was taken is compiled and published into the
+restored tenant, and returns HTTP 200. A boot check alone is not evidence —
+`StartupHook`'s reverted Patch #30 passed one and was catastrophic.
 
 **Why 47s and not the 25-30s the probe reported.** The probe measured only the
 `docker start --checkpoint` → OData window, with SQL already up and the database
 already restored by a previous step. The 47s here is everything a real run pays:
 starting SQL, restoring a 539 MB backup into it, copying the 2.1 GB checkpoint
-into the new container's directory, and then the restore itself. That is the
-honest number for the feature; the 25-30s figure is the process resume alone.
+into the new container's directory, and then the restore itself.
+
+### Not reproducible on Windows
+
+`docker checkpoint` is a front end for CRIU, and CRIU is Linux-only. Windows
+containers have no checkpoint/restore equivalent, so skipping NST startup by
+resuming a frozen service tier is not something a Windows BC container can do at
+any speed. That makes this a structural difference between the platforms rather
+than a tuning difference — but the Windows-side baseline to compare against
+belongs in `PipelinePerformanceComparison`, which measures it directly; do not
+pair these numbers with an estimated Windows figure.
 
 `PERFORMANCE-IDEAS.md` has the full history, including every barrier and its
 fix, and the several theories that turned out to be wrong.

@@ -31,11 +31,14 @@ name: Probe CRIU checkpoint/restore (diagnostic)
 # changes and not on unrelated pushes — test-versions.yml already demonstrated
 # what an unfiltered trigger costs in this repo. Delete this `push:` block once
 # the probe has told you what you need; it is scaffolding, not a fixture.
-# The push trigger has been REMOVED: the probe answered what a hosted runner can
-# answer (criu dumps BC fine; docker's restore cannot rebuild the netns — see
-# PERFORMANCE-IDEAS.md). Dispatch it deliberately if you resume on podman or a
-# self-hosted box.
+# Push trigger re-armed for ONE experiment: run 9 proved criu dumps BC fine and
+# only docker's netns rebuild fails, so this tests the same thing with
+# `network_mode: host` — no network namespace, nothing for docker to rebuild.
+# Strip this block again once it has answered.
 on:
+  push:
+    branches: [claude/hosted-runner-performance-42ljw4]
+    paths: ['.github/workflows/probe-criu.yml']
   workflow_dispatch:
     inputs:
       bc_version:
@@ -99,6 +102,12 @@ jobs:
       # produced run 5's failure, since that release predates this kernel.
       # Set an explicit tag (e.g. v4.0) to reproduce an older result.
       CRIU_REF: latest
+      # Run 9 restored into: bind-mount /proc/0/ns/net -> ...: no such file or
+      # directory. That is libnetwork re-attaching the container's sandbox by
+      # bind-mounting /proc/<init-pid>/ns/net, except on restore the init
+      # process does not exist yet, so the pid is 0. Host networking removes the
+      # namespace entirely, so there is nothing to rebuild.
+      HOST_NETWORK: "true"
 
     steps:
       - uses: actions/checkout@v4
@@ -187,6 +196,25 @@ jobs:
           docker checkpoint --help >/dev/null 2>&1 \
             && echo "docker checkpoint: available" \
             || echo "::warning::docker checkpoint subcommand unavailable"
+
+      - name: Host networking (removes the netns docker cannot rebuild)
+        if: ${{ env.HOST_NETWORK == 'true' }}
+        run: |
+          # COMPOSE_FILE means every later bare `docker compose` picks this up
+          # without touching the steps themselves.
+          cat > override-host.yml <<'YAML'
+          services:
+            bc:
+              network_mode: host
+              environment:
+                SQL_SERVER: localhost
+          YAML
+          echo "COMPOSE_FILE=docker-compose.yml:override-host.yml" >> "$GITHUB_ENV"
+          # bridge DNS ("sql") is gone with host networking, so BC reaches SQL on
+          # the published port; 1433 keeps the default so no connection string
+          # needs a port suffix.
+          echo "SQL_PORT=1433" >> "$GITHUB_ENV"
+          echo "bc will run with host networking, SQL_SERVER=localhost, sql published on 1433"
 
       - name: Fetch BC artifacts and images
         run: |

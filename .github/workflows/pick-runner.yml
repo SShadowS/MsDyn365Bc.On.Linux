@@ -34,11 +34,17 @@
 #    permission level — it has to be a PAT or a GitHub App token. That is the
 #    whole reason option 2 exists.
 #
-# 2. No token → reads the repository variable BC_SELF_HOSTED. Set it to "true"
-#    while your fleet is up, unset or "false" to send everything to hosted
-#    runners. No permissions needed, but it is a switch a human maintains, so it
-#    is stale exactly when it matters (the fleet went down and nobody flipped
-#    it) — and then jobs queue instead of falling back.
+# 2. No token → reads the repository variable BC_SELF_HOSTED. This ASSERTS
+#    availability rather than detecting it, so it does NOT give you fallback:
+#    if the fleet is offline the job queues, which is the exact thing this
+#    workflow exists to prevent. It is a manual switch for people who cannot
+#    issue a token, and it warns on every run.
+#
+# So: if what you want is "use the self-hosted runner when it is there, and a
+# hosted one when it is not", you need option 1. There is no way to ask the API
+# which runners are online with GITHUB_TOKEN — `administration: read` cannot be
+# granted to it at any permission level — so a PAT or GitHub App token is the
+# price of real fallback.
 #
 # Neither is airtight: a runner can go offline, or be taken by another job, in
 # the seconds between this job answering and the next one dispatching. That
@@ -155,7 +161,16 @@ jobs:
             fi
           else
             case "${BC_SELF_HOSTED:-}" in
-              true|True|TRUE|1|yes) use_self=true; why="repository variable BC_SELF_HOSTED is set" ;;
+              true|True|TRUE|1|yes)
+                use_self=true
+                why="repository variable BC_SELF_HOSTED is set (availability NOT verified)"
+                # The point of this workflow is falling back when a self-hosted
+                # runner is configured but not AVAILABLE, and this path cannot
+                # do that: it asserts availability, it does not detect it. If
+                # the fleet is offline the next job queues — for up to 24h —
+                # instead of going to a hosted runner. Say so every time.
+                echo "::warning::BC_SELF_HOSTED sends this run to '$PREFERRED' without checking whether any runner is online. If the fleet is down the job will QUEUE, not fall back. Supply runner_token (a PAT or App token with administration:read) to get real fallback."
+                ;;
               *) why="no runner_token and BC_SELF_HOSTED is not set" ;;
             esac
           fi

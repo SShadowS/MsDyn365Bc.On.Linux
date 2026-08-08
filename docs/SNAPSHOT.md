@@ -404,12 +404,40 @@ jobs:
       app_dirs: "app"
 ```
 
-It decides one of two ways:
+**Real fallback needs a token.** The whole point is to send the job to a hosted
+runner when a self-hosted one is *configured but not available*, and only the
+API can tell you that:
 
-| | how it knows | cost |
+| | how it knows | gives you fallback? |
 |---|---|---|
-| `runner_token` given | asks the API which runners are online, and optionally which are idle | listing runners needs `administration: read`, which **`GITHUB_TOKEN` cannot be granted at any permission level** — it has to be a PAT or GitHub App token |
-| no token | reads the repository variable `BC_SELF_HOSTED` | no permissions at all, but it is a switch a human maintains, so it is stale exactly when it matters |
+| `runner_token` given | asks the API which runners are online, and optionally which are idle | **yes** |
+| no token | reads the repository variable `BC_SELF_HOSTED` | **no** — it asserts availability rather than detecting it |
+
+Listing runners needs `administration: read` (repo) or
+`organization_self_hosted_runners: read` (org). **`GITHUB_TOKEN` cannot be
+granted either at any permission level**, so it has to be a PAT or a GitHub App
+token. That is the price of fallback; there is no way around it.
+
+Without a token, `BC_SELF_HOSTED=true` sends the job to the self-hosted label
+whether or not anything is listening, so an offline fleet means the job queues —
+for up to 24 hours — which is exactly what you were trying to avoid. The picker
+emits a `::warning::` on every such run saying so. Use it only if you cannot
+issue a token, and treat it as a manual switch rather than as fallback.
+
+With a token, the decisions are:
+
+| fleet state | `require_idle: false` (default) | `require_idle: true` |
+|---|---|---|
+| online and idle | self-hosted | self-hosted |
+| **registered but offline** | **hosted** | **hosted** |
+| online, all busy | self-hosted (queues behind itself) | hosted |
+| none registered | hosted | hosted |
+
+The busy row is a policy choice, not an accident. On a fleet of one, queueing
+behind your own runner is usually better than a hosted runner, because that
+machine holds the warm artifact cache and the snapshots — a few minutes of
+waiting against ~90s of cold boot plus a full artifact fetch. Set
+`require_idle: true` if latency matters more than warmth.
 
 **Neither is airtight, and the reason is structural:** a runner can go offline,
 or be taken by another job, in the seconds between the picker answering and the

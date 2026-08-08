@@ -400,7 +400,11 @@ create() {
   log "checkpoint written in $(( $(date +%s) - t0 ))s"
   # Copied rather than written in place; see _ckpt_path above for why. root-owned
   # mode 700, so both the read and the ownership fix need sudo.
-  sudo cp -a "$(_ckpt_path "$cid")/cp1" "$s/checkpoint/cp1"
+  # --reflink=auto: a copy-on-write clone on btrfs/XFS (near-instant, no extra
+  # space) and an ordinary copy everywhere else. The two 2.1 GB copies are the
+  # largest single component of restore time on a fast disk, so this is worth
+  # the one word even though it is a no-op on ext4.
+  sudo cp -a --reflink=auto "$(_ckpt_path "$cid")/cp1" "$s/checkpoint/cp1"
   [ -d "$s/checkpoint/cp1" ] || die "checkpoint did not copy into the store"
 
   # The checkpoint is only half of what the process needs: criu references open
@@ -550,7 +554,7 @@ restore() {
   local dst; dst=$(_ckpt_path "$cid")
   sudo mkdir -p "$dst"
   sudo rm -rf "${dst:?}/cp1"
-  sudo cp -a "$s/checkpoint/cp1" "$dst/cp1"
+  sudo cp -a --reflink=auto "$s/checkpoint/cp1" "$dst/cp1"
   if ! docker start --checkpoint cp1 "$cid" 2>/tmp/snapshot-restore.err; then
     log "restore failed — cold boot:"; sed -n 1,5p /tmp/snapshot-restore.err >&2
     sudo grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true

@@ -375,6 +375,38 @@ pair these numbers with an estimated Windows figure.
 `PERFORMANCE-IDEAS.md` has the full history, including every barrier and its
 fix, and the several theories that turned out to be wrong.
 
+## Benchmarking it on your own machine
+
+The published numbers come from GitHub-hosted runners, which can only show that
+the restore is **correct** — the store does not survive the job there, so they
+cannot show the win, and their cold-boot figure has a 35s spread. Your machine
+is the real measurement:
+
+```bash
+export BC_ARTIFACTS_DIR=/var/cache/bc-artifacts
+scripts/bench-snapshot.sh -n 5                 # warm vs restore
+scripts/bench-snapshot.sh -n 3 --include-cold  # add a from-nothing baseline
+```
+
+Three rungs under an identical compose configuration, so only the cache state
+varies, each timed the same way — command issued until `GET /BC/ODataV4/Company`
+returns 200:
+
+| rung | state |
+|---|---|
+| cold | no volumes, no snapshot — a machine that has never run BC |
+| warm | volumes kept, no snapshot — what a self-hosted runner does today |
+| restore | volumes kept, snapshot present — snapshot mode |
+
+It reports medians with min/max, because a single slow iteration should not move
+the headline and a noisy run should be visible rather than averaged away.
+
+**Expect a better ratio than the hosted-runner figures.** Two 2.1 GB copies are
+the largest component of a restore, and they behave completely differently on
+NVMe — and on **btrfs or XFS** they become reflinks and cost almost nothing,
+since `snapshot.sh` copies with `--reflink=auto`. The bench prints your store's
+filesystem and says which case you are in.
+
 ## Testing the key
 
 ```bash

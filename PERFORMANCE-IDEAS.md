@@ -182,7 +182,20 @@ OData /Company : 200             publish HTTP 200   <- novel app, compiled after
 
 So a restored NST reconnects to a SQL Server it has never spoken to, holding a
 connection pool whose peer no longer exists, and the tenant still works well
-enough to publish a freshly compiled extension. **Feasibility is settled.**
+enough to publish a freshly compiled extension.
+
+Run 19 repeated it independently, because one observation of the case the whole
+design rests on is not enough:
+
+| | run 18 | run 19 |
+|---|---|---|
+| cold boot to healthy | 137s | 140s |
+| checkpoint | 46s | 42s |
+| **restore to OData 200** | **25s** | **29s** |
+| novel app publish | 200 | 200 |
+
+**Feasibility is settled**, and the restore is a ~110s saving against a cold
+boot on this runner class.
 
 What is left is engineering, not risk:
 

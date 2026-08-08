@@ -85,6 +85,15 @@ jobs:
           bash scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$BC_ARTIFACTS_DIR"
           ./scripts/snapshot.sh key
 
+      # Four failures in this series were ENOSPC wearing other costumes. Record
+      # the space before and after so a repeat is obvious at a glance, and show
+      # what the store and docker are holding.
+      - name: Disk before
+        run: |
+          df -Ph / /tmp /var/cache/bc-linux 2>/dev/null || df -Ph
+          echo "dangling images: $(docker images -f dangling=true -q | wc -l)  reclaimable:"
+          docker system df 2>/dev/null | head -5
+
       - name: Benchmark
         id: bench
         run: |
@@ -95,6 +104,12 @@ jobs:
       # Did --reflink actually engage? On btrfs/XFS a cloned checkpoint costs
       # almost no space, so apparent size >> real usage. If the two match, the
       # copies are real and ~2.1 GB of the restore time is disk, not CRIU.
+      - name: Disk after
+        if: always()
+        run: |
+          df -Ph / /tmp /var/cache/bc-linux 2>/dev/null || df -Ph
+          docker system df 2>/dev/null | head -5
+
       - name: Reflink check
         if: always()
         run: |
@@ -145,7 +160,7 @@ jobs:
           docker compose ps -a || true
           docker compose logs bc --tail 60 2>&1 | cut -c1-200 || true
           ./scripts/snapshot.sh status || true
-          grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -20 || true
+          grep -E 'Error \(|killed by signal' /var/tmp/criu-work/criu.log 2>/dev/null | tail -20 || true
 
       # Leave the machine idle. A benchmark that parks a BC on the developer's
       # ports until they notice is a bad guest.

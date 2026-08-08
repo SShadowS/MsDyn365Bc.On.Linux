@@ -13,7 +13,13 @@ services:
       # CLAUDE.md, "CRITICAL: the mount must be on BOTH the bc AND sql
       # services"). The sql data dir itself is a tmpfs, so the container being
       # replaced is exactly the case this has to survive.
-      - ${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}:/sqlsnap
+      # /var/tmp, NOT /tmp: on many distros (Arch among them) /tmp is a tmpfs,
+      # i.e. RAM. The database backup staged here is ~540 MB and is written on
+      # every create and every restore, so putting it in /tmp spends memory and
+      # eventually returns ENOSPC -- which surfaced as a failed criu dump, a
+      # missing criu log and "bc is not serving OData" before anything said
+      # "no space left on device". /var/tmp is disk-backed by convention.
+      - ${BC_SNAPSHOT_SQLDIR:-/var/tmp/bc-sqlstage}:/sqlsnap
 
   bc:
     # Docker restores a container by bind-mounting /proc/<init-pid>/ns/net to

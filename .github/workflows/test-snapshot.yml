@@ -73,7 +73,7 @@ jobs:
       # not available in job-level env, and referencing it made the whole
       # workflow unparseable — zero jobs, a run named after the file path, and
       # no error attributable to any step.
-      BC_SNAPSHOT_SQLDIR: /tmp/sqlsnap
+      BC_SNAPSHOT_SQLDIR: /var/tmp/bc-sqlstage
       COMPOSE_FILE: docker-compose.yml:docker-compose.snapshot.yml
       # 3.17 (what jammy packages) dumps BC perfectly and segfaults the restored
       # task, with no diagnostic beyond "killed by signal 11". Three probe runs
@@ -298,4 +298,4 @@ jobs:
         run: |
           docker compose ps -a || true
           docker compose logs bc --tail 80 2>&1 | cut -c1-200 || true
-          sudo grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -20 || true
+          sudo grep -E 'Error \(|killed by signal' /var/tmp/criu-work/criu.log 2>/dev/null | tail -20 || true

@@ -219,13 +219,14 @@ fi
 # runc reads this when the daemon invokes criu; `docker checkpoint create`
 # exposes no flag for any of it. Each option was unlocked by a specific failed
 # run -- see PERFORMANCE-IDEAS.md.
-if grep -q '^tcp-established' /etc/criu/runc.conf 2>/dev/null; then
+if grep -q '^tcp-established' /etc/criu/runc.conf 2>/dev/null \
+   && grep -q '^work-dir /var/tmp/criu-work' /etc/criu/runc.conf 2>/dev/null; then
   ok "/etc/criu/runc.conf"
 else
   todo "/etc/criu/runc.conf missing the options criu needs for BC"
   if [ "$CHECK_ONLY" = 0 ] && ask "write /etc/criu/runc.conf?"; then
     sudo mkdir -p /etc/criu \
-      && printf 'tcp-established\ntcp-close\nfile-locks\next-unix-sk\nlink-remap\nghost-limit 512M\nwork-dir /tmp/criu-work\nlog-file criu.log\n' \
+      && printf 'tcp-established\ntcp-close\nfile-locks\next-unix-sk\nlink-remap\nghost-limit 512M\nwork-dir /var/tmp/criu-work\nlog-file criu.log\n' \
          | sudo tee /etc/criu/runc.conf >/dev/null \
       && ok "wrote /etc/criu/runc.conf" \
       || { bad "could not write /etc/criu/runc.conf"; NEED=1; }
@@ -246,6 +247,21 @@ else
     NEED=1
   fi
 fi
+
+# Staging for the database backup. Explicitly OFF /tmp: that is a ramdisk on
+# Arch and others, and a ~540 MB backup written there on every create and
+# restore exhausts it — which is what took down benchmark runs 7 through 11,
+# each time wearing a different disguise.
+for d in /var/tmp/bc-sqlstage /var/tmp/criu-work; do
+  if [ -d "$d" ] && [ -w "$d" ]; then
+    ok "staging dir $d"
+  else
+    mkdir -p "$d" 2>/dev/null && chmod 777 "$d" 2>/dev/null \
+      && ok "created $d" || { bad "could not create $d"; NEED=1; }
+  fi
+  [ "$(stat -f -c %T "$d" 2>/dev/null)" = tmpfs ] \
+    && { bad "$d is on tmpfs (RAM) — pick a disk-backed path"; NEED=1; }
+done
 
 # The artifact cache is machine-level state too, and creating it here is what
 # keeps sudo out of the benchmark job.

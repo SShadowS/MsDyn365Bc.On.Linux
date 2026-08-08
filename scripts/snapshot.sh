@@ -275,9 +275,13 @@ _verify_host_config() {
   grep -q '^tcp-established' /etc/criu/runc.conf 2>/dev/null \
     || { log "/etc/criu/runc.conf missing or lacks tcp-established"; bad=1; }
   [ "$bad" = 0 ] || { log "run scripts/setup-snapshot-host.sh once on this machine"; return 1; }
-  # Ours to create, in /tmp, as ourselves. criu runs as root and writes its log
-  # here with a default umask, so the log stays readable without privilege.
-  mkdir -p /tmp/criu-work 2>/dev/null && chmod 777 /tmp/criu-work 2>/dev/null || true
+  # Ours to create, as ourselves. criu runs as root and writes its log here with
+  # a default umask, so it stays readable without privilege. /var/tmp rather
+  # than /tmp because /tmp is a ramdisk on many distros.
+  mkdir -p /var/tmp/criu-work 2>/dev/null && chmod 777 /var/tmp/criu-work 2>/dev/null || true
+  # A stale runc.conf still naming /tmp would send criu's scratch back into RAM.
+  grep -q 'work-dir /var/tmp/criu-work' /etc/criu/runc.conf 2>/dev/null \
+    || log "NOTE: /etc/criu/runc.conf does not point work-dir at /var/tmp/criu-work — re-run scripts/setup-snapshot-host.sh"
   return 0
 }
 
@@ -291,7 +295,7 @@ _verify_host_config() {
 # Print a root-owned file we have no sudo for. Same authority as the checkpoint
 # copies. Run 10's dump log sat at a containerd path readable only by root, and
 # a bare `[ -r ]` test skipped it without a word — so the failure reported
-# "(no /tmp/criu-work/criu.log)" and stopped there.
+# "(no /var/tmp/criu-work/criu.log)" and stopped there.
 _root_read() {
   local dir base; dir=$(dirname "$1"); base=$(basename "$1")
   [ -d "$dir" ] || return 1
@@ -337,7 +341,7 @@ _create_failed() {
 }
 
 _prepare_sqldir() {
-  local d="${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}"
+  local d="${BC_SNAPSHOT_SQLDIR:-/var/tmp/bc-sqlstage}"
   # SQL Server writes the backup here as uid 10001, so it has to be
   # world-writable. Creating it ourselves before docker ever mounts it is the
   # normal path; but a directory left root-owned by an earlier run (docker
@@ -425,6 +429,38 @@ _odata_diagnosis() {
 _docker_root() { docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker; }
 _ckpt_path()   { echo "$(_docker_root)/containers/$1/checkpoints"; }
 
+# A snapshot needs ~3 GB in the store and room for criu's scratch. Running out
+# does NOT announce itself: across runs 7-11 it appeared as a failed restore, a
+# bare "criu failed: type DUMP", a missing criu log, and "bc is not serving
+# OData" whose real text was "write /tmp/runc-process...: no space left on
+# device". Check first and say so plainly.
+_check_space() {
+  local ok=0 store dockroot sqldir
+  store=$(_resolve_store_root 2>/dev/null || echo /var/tmp)
+  dockroot=$(_docker_root)
+  sqldir="${BC_SNAPSHOT_SQLDIR:-/var/tmp/bc-sqlstage}"
+  # Nothing of ours should sit on a tmpfs: it is RAM, and a 540 MB backup plus
+  # criu scratch will exhaust it long before the disk.
+  local d
+  for d in "$store" "$sqldir" /var/tmp/criu-work; do
+    [ -d "$d" ] || continue
+    [ "$(stat -f -c %T "$d" 2>/dev/null)" = tmpfs ] \
+      && log "WARNING: $d is on tmpfs (RAM). Set BC_SNAPSHOT_SQLDIR to a disk-backed path."
+  done
+  local where
+  for where in "$store" "$sqldir" "$dockroot"; do
+    [ -d "$where" ] || continue
+    local free_mb; free_mb=$(df -Pm "$where" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "$free_mb" ] || continue
+    if [ "$free_mb" -lt 4096 ]; then
+      log "only $((free_mb/1024)) GB free on $where (need ~4 GB) — $(df -Ph "$where" | awk 'NR==2{print $1" "$5" used"}')"
+      ok=1
+    fi
+  done
+  [ "$ok" = 0 ] || log "free space: $(df -Ph "$store" /tmp 2>/dev/null | awk 'NR>1{printf "%s=%s free  ", $6, $4}')"
+  return $ok
+}
+
 # ─── status ───────────────────────────────────────────────────────────────────
 status() {
   local root
@@ -458,6 +494,7 @@ create() {
   s=$(_store) || die "cannot compute a snapshot key (run: scripts/snapshot.sh key)"
   cid=$(docker compose ps -q bc || true)
   [ -n "$cid" ] || die "no running bc container"
+  _check_space || die "not enough free space to take a snapshot"
   local odata; odata=$(_bc_odata)
   if [ "$odata" != "200" ]; then
     log "bc is not serving OData (HTTP $odata) — refusing to snapshot an unhealthy BC"
@@ -480,22 +517,22 @@ create() {
   # The daemon's own message says only "criu failed: type DUMP" and names a log
   # path. THAT file has the reason, and create() was the last place in this
   # script still not printing it — restore() has done so since the segfault
-  # hunt. runc.conf pins work-dir to /tmp/criu-work, so the log is there;
+  # hunt. runc.conf pins work-dir to /var/tmp/criu-work, so the log is there;
   # containerd's task dir is checked too because the daemon quotes that path.
   if ! docker checkpoint create --leave-running=false "$cid" cp1 2>/tmp/snapshot-dump.err; then
     log "docker checkpoint create failed:"
     sed -n 1,3p /tmp/snapshot-dump.err >&2
     log "--- criu dump log ---"
     # Two candidate locations, and the containerd one needs the docker socket to
-    # read. runc.conf pins work-dir to /tmp/criu-work, but run 10 found nothing
+    # read. runc.conf pins work-dir to /var/tmp/criu-work, but run 10 found nothing
     # there while the daemon pointed at containerd's copy -- which suggests
     # runc.conf may not have been honoured at all, and that would ALSO mean
     # tcp-established was not applied, which is exactly what makes a BC dump
     # fail. Print whichever exists.
     local dumped=0
-    if [ -s /tmp/criu-work/criu.log ]; then
-      log "(from /tmp/criu-work/criu.log)"
-      { grep -hE "Error \(|Warn \(" /tmp/criu-work/criu.log || tail -20 /tmp/criu-work/criu.log; } \
+    if [ -s /var/tmp/criu-work/criu.log ]; then
+      log "(from /var/tmp/criu-work/criu.log)"
+      { grep -hE "Error \(|Warn \(" /var/tmp/criu-work/criu.log || tail -20 /var/tmp/criu-work/criu.log; } \
         | tail -20 >&2; dumped=1
     fi
     local tasklog="/run/containerd/io.containerd.runtime.v2.task/moby/$cid/criu-dump.log"
@@ -508,7 +545,7 @@ create() {
       # If criu logged HERE rather than in the configured work-dir, runc did not
       # apply /etc/criu/runc.conf, and none of its options -- tcp-established
       # above all -- reached this dump.
-      [ -s /tmp/criu-work/criu.log ] || \
+      [ -s /var/tmp/criu-work/criu.log ] || \
         log "NOTE: criu did not use the work-dir from /etc/criu/runc.conf, so its options may not have applied either"
     fi
     [ "$dumped" = 1 ] || log "(no criu log found in either location)"
@@ -539,9 +576,15 @@ create() {
   # its container from the commit instead of from the bc-runner image. This is
   # general: it also covers /tmp/bc-ready and anything else BC wrote outside a
   # volume, rather than enumerating files we happen to know about.
-  local img
+  local img prev
   img="bc-snapshot:$(snapshot_key)"
+  # Committing over an existing tag leaves the PREVIOUS image dangling, and
+  # nothing was reaping it: eleven benchmark runs left eleven multi-GB orphans.
+  prev=$(docker image inspect --format '{{.Id}}' "$img" 2>/dev/null | head -1) || true
   docker commit "$cid" "$img" >/dev/null
+  if [ -n "${prev:-}" ] && [ "$prev" != "$(docker image inspect --format '{{.Id}}' "$img" 2>/dev/null | head -1)" ]; then
+    docker image rm -f "$prev" >/dev/null 2>&1 || true
+  fi
   log "rootfs committed as $img"
 
   # AFTER the checkpoint, so the database matches the frozen process exactly.
@@ -582,7 +625,7 @@ create() {
     # so whatever breaks here breaks the feature, not just this convenience.
     log "could not resume from the fresh checkpoint — cold booting so the caller is not left without a BC"
     sed -n 1,5p /tmp/snapshot-resume.err >&2 || true
-    grep -E "Error \\(|killed by signal" /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
+    grep -E "Error \\(|killed by signal" /var/tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
     docker compose up -d --wait
   fi
   trap - EXIT
@@ -628,8 +671,8 @@ restore() {
   # gone, and reconnects on first use — but only if there is something to
   # reconnect TO, with the database it expects.
   _prepare_sqldir
-  cp "$s/cronus.bak" "${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}/cronus.bak"
-  chmod 644 "${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}/cronus.bak"
+  cp "$s/cronus.bak" "${BC_SNAPSHOT_SQLDIR:-/var/tmp/bc-sqlstage}/cronus.bak"
+  chmod 644 "${BC_SNAPSHOT_SQLDIR:-/var/tmp/bc-sqlstage}/cronus.bak"
   docker compose up -d sql
   local i
   for i in $(seq 1 90); do
@@ -689,7 +732,7 @@ restore() {
   local t_cp; t_cp=$(date +%s)
   if ! docker start --checkpoint cp1 "$cid" 2>/tmp/snapshot-restore.err; then
     log "restore failed — cold boot:"; sed -n 1,5p /tmp/snapshot-restore.err >&2
-    grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
+    grep -E 'Error \(|killed by signal' /var/tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
     _discard "$s" "restore failed"
     return 1
   fi

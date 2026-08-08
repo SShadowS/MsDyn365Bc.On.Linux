@@ -191,8 +191,18 @@ jobs:
           set -e
           CID="${{ steps.boot.outputs.cid }}"
           T0=$(date +%s)
+          echo "criu on PATH: $(command -v criu || echo NONE)"
+          echo "dockerd sees: $(sudo docker info 2>/dev/null | grep -iE 'runtime|storage driver' | tr '\n' ' ')"
           if ! docker checkpoint create --leave-running=false "$CID" cp1 2>checkpoint.err; then
             cat checkpoint.err
+            # Put it where a phone can read it: the run summary, not 1700 log lines.
+            {
+              echo "### Checkpoint failed"
+              echo '```'
+              head -c 800 checkpoint.err
+              echo '```'
+              echo "criu on PATH: \`$(command -v criu || echo NONE)\`"
+            } >> "$GITHUB_STEP_SUMMARY"
             if grep -qiE "tcp|socket|established" checkpoint.err; then
               echo "::warning::checkpoint refused on established TCP connections — expected; retry via raw criu --tcp-established"
               echo "classification=tcp-sockets" >> "$GITHUB_OUTPUT"
@@ -261,7 +271,7 @@ jobs:
       # ── The strict pass condition ─────────────────────────────────────────
       - name: Compile and publish a NOVEL app after restore
         id: publish
-        if: ${{ env.VERIFY_PUBLISH == 'true' }}
+        if: ${{ env.VERIFY_PUBLISH == 'true' && steps.restore.outcome == 'success' }}
         continue-on-error: true
         run: |
           set -e

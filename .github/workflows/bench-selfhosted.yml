@@ -90,8 +90,23 @@ jobs:
       # what the store and docker are holding.
       - name: Disk before
         run: |
-          df -Ph / /tmp /var/cache/bc-linux 2>/dev/null || df -Ph
-          echo "dangling images: $(docker images -f dangling=true -q | wc -l)  reclaimable:"
+          # `df` alone did not explain run 12: it showed 1.1 TB free on the
+          # filesystem holding /tmp while writes there returned ENOSPC. On btrfs
+          # that is usually METADATA exhaustion, which `df` cannot see, so check
+          # it directly. Inodes too, for the non-btrfs case.
+          df -Ph / /tmp /var/tmp /var/cache/bc-linux 2>/dev/null || df -Ph
+          echo "--- filesystem type of each path we write to ---"
+          for d in /tmp /var/tmp /var/tmp/bc-sqlstage /var/cache/bc-linux; do
+            [ -e "$d" ] && echo "  $d: $(stat -f -c %T "$d" 2>/dev/null)"
+          done
+          echo "--- btrfs allocation (metadata full = ENOSPC despite free space) ---"
+          command -v btrfs >/dev/null && sudo -n btrfs filesystem df / 2>/dev/null \
+            || btrfs filesystem df / 2>/dev/null || echo "  (needs root or not btrfs)"
+          df -Phi / 2>/dev/null | sed 's/^/  /'
+          echo "--- containerd checkpoint staging left in tmp ---"
+          ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l
+          du -sh /tmp/ctrd-checkpoint* 2>/dev/null | tail -5 || true
+          echo "dangling images: $(docker images -f dangling=true -q | wc -l)"
           docker system df 2>/dev/null | head -5
 
       - name: Benchmark
@@ -107,7 +122,9 @@ jobs:
       - name: Disk after
         if: always()
         run: |
-          df -Ph / /tmp /var/cache/bc-linux 2>/dev/null || df -Ph
+          df -Ph / /tmp /var/tmp /var/cache/bc-linux 2>/dev/null || df -Ph
+          echo "ctrd staging dirs left: $(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l)"
+          echo "dangling images: $(docker images -f dangling=true -q | wc -l)"
           docker system df 2>/dev/null | head -5
 
       - name: Reflink check

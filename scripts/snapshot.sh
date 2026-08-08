@@ -303,6 +303,24 @@ _root_read() {
     "cat '/r/$base'" 2>/dev/null
 }
 
+# containerd stages every `docker checkpoint create` in /tmp/ctrd-checkpoint<rand>
+# and does NOT remove it afterwards. Each one holds a full copy of the
+# checkpoint (~2.1 GB), and on a distro where /tmp is a tmpfs they accumulate in
+# RAM: seven of them were found after this benchmark series, roughly 15 GB, on a
+# machine whose tmpfs is about that size. Moving our OWN staging to /var/tmp did
+# nothing about these, because containerd picks the path from the daemon's
+# TMPDIR, not ours.
+#
+# They are root-owned, so reap them through the docker socket. The glob is
+# anchored to containerd's own prefix; a no-match leaves the literal string,
+# which rm -rf ignores.
+_reap_ctrd_staging() {
+  local dir="${TMPDIR:-/tmp}"
+  docker run --rm -v "$dir":/t --entrypoint sh "$(_bc_image_ref)" -c \
+    'for d in /t/ctrd-checkpoint*; do case "$d" in */ctrd-checkpoint\*) ;; *) rm -rf "$d";; esac; done' \
+    >/dev/null 2>&1 || true
+}
+
 _export_checkpoint() {  # <container-id> <dest-dir>   result is owned by us
   docker run --rm -v "$(_ckpt_path "$1")":/src:ro -v "$2":/dst \
     --entrypoint sh "$(_bc_image_ref)" -c \
@@ -336,6 +354,7 @@ _create_failed() {
   [ -n "${CREATE_STORE:-}" ] && _rm_store "$CREATE_STORE"
   # The stamp may not exist yet, so _rm_store cannot have found the image name.
   docker image rm -f "bc-snapshot:$(snapshot_key 2>/dev/null || echo none)" >/dev/null 2>&1 || true
+  _reap_ctrd_staging
   docker compose up -d --wait >/dev/null 2>&1 || true
   return "$rc"
 }
@@ -520,6 +539,7 @@ create() {
   # hunt. runc.conf pins work-dir to /var/tmp/criu-work, so the log is there;
   # containerd's task dir is checked too because the daemon quotes that path.
   if ! docker checkpoint create --leave-running=false "$cid" cp1 2>/tmp/snapshot-dump.err; then
+    _reap_ctrd_staging
     log "docker checkpoint create failed:"
     sed -n 1,3p /tmp/snapshot-dump.err >&2
     log "--- criu dump log ---"
@@ -554,6 +574,8 @@ create() {
   [ "$(docker inspect --format '{{.State.Status}}' "$cid")" = "exited" ] \
     || die "bc still running after checkpoint — nothing was captured"
   log "checkpoint written in $(( $(date +%s) - t0 ))s"
+  # Reap before the copy, so the peak is one staged copy rather than two.
+  _reap_ctrd_staging
   # Copied rather than written in place; see _ckpt_path above for why. The
   # daemon writes it root:700, so the copy goes through a container on the
   # docker socket -- authority this caller already has -- instead of sudo.

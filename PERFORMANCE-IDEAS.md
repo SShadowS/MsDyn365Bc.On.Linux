@@ -112,7 +112,14 @@ Not attempted here: this session ran on a Firecracker microVM whose kernel has
 level and `docker checkpoint` (which sits on CRIU) is unavailable with it.
 Stock Ubuntu hosts have the option enabled and `criu` in universe.
 
-### Probed on GitHub-hosted runners, 2026-08-08 — the wall is the SQL socket pool
+### Probed on GitHub-hosted runners, 2026-08-08 — IT WORKS; skip to "RESULT (run 16)"
+
+Everything between here and that section is the path, kept because each dead
+end costs a five-minute run to rediscover. The headline is that a booted BC
+service tier checkpoints and restores intact: 127s of boot replaced by 30s of
+restore, with the tenant still able to publish a newly compiled app.
+
+### The path — the wall was NOT the SQL socket pool
 
 `.github/workflows/probe-criu.yml` ran this end to end. Results, so nobody
 repeats the dead ends:
@@ -146,69 +153,82 @@ fresh SQL container remains the hard, untested case. And a hosted runner is
 ephemeral, so none of this measures the win — that only exists where the
 checkpoint survives between jobs.
 
-### RESULT: criu CAN dump BC. `docker start --checkpoint` cannot restore it.
+### RESULT (run 16): it works. A booted BC restores in 30s and still publishes.
 
-Run 9 of the probe, ubuntu-22.04 / kernel 6.8.0-1062-azure / criu from apt,
-with `/etc/criu/runc.conf` containing `tcp-established`, `tcp-close`,
-`file-locks`, `ext-unix-sk`, `link-remap`, `ghost-limit 512M`:
+ubuntu-22.04, kernel 6.8.0-azure, **criu v4.2.1 built from source**, host
+networking, `/etc/criu/runc.conf` = `tcp-established`, `tcp-close`,
+`file-locks`, `ext-unix-sk`, `link-remap`, `ghost-limit 512M`, plus
+`vm.overcommit_memory=1` and `vm.max_map_count=1048576`:
 
 ```
-checkpoint took 47s
-container status after checkpoint: exited     <- dump succeeded, container really stopped
+cold boot to healthy: 127s
+NST RSS: 2.39 GB   private dirty (checkpoint payload): 2.07 GB
+checkpoint took 51s
+container status after checkpoint: exited      <- it really stopped
+restore to OData 200: 30s
+OData /Company : 200
+publish HTTP 200                               <- a NOVEL app, compiled after restore
+checkpoint on disk: 2.1 GB
 ```
 
-**A fully booted BC service tier checkpoints cleanly** — 40 threads, 838 fds,
-~17 established connections to SQL, 2.16 GB of private dirty pages, 47s, and
-not one `Error (criu…)` line. Every barrier found on the way was a criu config
-option, not a BC incompatibility:
+**127s of boot becomes 30s of restore**, and the tenant survives — a freshly
+compiled app publishes through the dev endpoint afterwards, which is the check
+that distinguishes this from Patch #30 (looked fine on a boot check, was
+catastrophic). Every prerequisite is now known-good, so the design is viable
+in principle and the remaining questions are about plumbing, not feasibility.
+
+Sixteen runs to get here. Each barrier and its fix, so none is re-derived:
 
 | barrier | run | fix |
 |---|---|---|
-| `Connected TCP socket` (the SQL pool) | 7 | `tcp-established` |
+| kernel cannot run criu at all (vDSO symtable) | 5-6 | `ubuntu-22.04`, **not** `ubuntu-latest` (kernel 6.17) |
+| `Connected TCP socket` (the SQL pool) | 7 | `tcp-established` in `/etc/criu/runc.conf` |
 | `Some file locks are hold by dumping tasks` | 8 | `file-locks` |
+| restore: `bind-mount /proc/0/ns/net … no such file` | 9 | `network_mode: host` — docker cannot rebuild a bridge netns whose init pid does not exist yet |
+| restore: ENOMEM remapping | 13 | `vm.overcommit_memory=1`, `vm.max_map_count=1048576`. RAM was 4/15 GB used — a policy refusal, not exhaustion. .NET's GC gives NST a **263 GB** VmSize and criu must recreate every reservation |
+| restore: `killed by signal 11`, no diagnostic | 14-16 | **criu 4.2.1 from source.** jammy packages 3.17 (2022), which dumps BC fine and segfaults the restored task |
 
-Restore is where it stops, and the failure is Docker's, not criu's or BC's:
+That last row is the one worth remembering: three runs went into theories about
+BC (W^X double mapping, glibc rseq, our JMP hooks) for a failure that was
+entirely criu's age. `DOTNET_EnableWriteXorExecute=0` was tested and made no
+difference; rseq was never the cause — 4.2.1 restores BC with it left on.
+**Check the criu version before theorising about the process.**
 
-```
-Error response from daemon: bind-mount /proc/0/ns/net
-  -> /var/run/docker/netns/7acc266207d3: no such file or directory
-```
+What is still open, in the order it matters:
 
-`/proc/0/ns/net` is PID 0's network namespace, which cannot exist. Docker's
-checkpoint/restore cannot rebuild the netns for a container on a user-defined
-bridge network, which is exactly what compose creates. Nothing about this is
-addressable from our side of the boundary.
+1. **A fresh SQL container.** Run 16 restored against the same live SQL
+   container throughout. `tcp-close` means criu closes the pooled connections
+   rather than repairing them, so what actually has to hold is that ADO.NET
+   reconnects on first use — but that was never put under stress. The probe now
+   restarts sql between checkpoint and restore (`RESTART_SQL_BEFORE_RESTORE`).
+   A genuinely fresh container additionally needs the database restored into it,
+   which is the entrypoint's job and does not run on a resumed process.
+2. **Moving the payload.** 2.1 GB per checkpoint. On a self-hosted runner it
+   sits on disk and costs nothing. Through GitHub's cache it is the artifact
+   caching ban all over again (CLAUDE.md) — 10 GB repo cap, upload every run —
+   so **this is a self-hosted-runner feature, and on hosted runners the 51s
+   checkpoint plus the transfer is worse than the 127s boot it replaces.**
+3. **What invalidates a checkpoint.** BC version, image, and the published app
+   set at minimum. Same shape as the three stamps in CLAUDE.md.
+4. **podman** — `podman container checkpoint/restore` is first-class rather
+   than experimental and takes these options as flags. Not needed now that the
+   docker route works, but it is the fallback if the daemon's netns handling
+   becomes a problem again.
 
-**So the conclusion is narrow and useful: the CRIU half is proven, the
-docker-checkpoint half is a dead end.** If this is picked up, do not spend
-another run on `docker start --checkpoint`. The routes that remain:
+Reproducing it, on any host with `CONFIG_CHECKPOINT_RESTORE=y`:
 
-- **podman** — `podman container checkpoint/restore` is first-class rather than
-  experimental (Red Hat maintains both podman and criu), supports these options
-  directly as flags, and is the only mainstream runtime where this is a
-  supported feature rather than a 8-year-old experiment. Untried.
-- **`runc restore` directly**, bypassing the daemon's netns handling.
-
-And the two constraints that survive regardless: restore still needs a SQL peer
-whose TCP sequence numbers match, so a FRESH SQL container remains the hard
-untested case; and a hosted runner is ephemeral, so none of this measures the
-win, which exists only where the checkpoint survives between jobs.
-
-Nine runs got here. Five were spent on defects in the probe rather than the
-question — if you resume this, do it on a box where `criu dump` runs
-interactively in seconds instead of five-minute CI round trips.
-
-The original probe recipe, retained for a self-hosted attempt:
-
-1. Host with `CONFIG_CHECKPOINT_RESTORE=y`; `apt-get install criu`;
-   `criu check --all`.
+1. Build criu **≥ 4.2.1** from source. Distro packages are too old.
 2. `dockerd` with `{"experimental": true}` in `/etc/docker/daemon.json`.
-3. Boot to healthy with the DB snapshot + warm assembly cache.
-4. `docker checkpoint create --leave-running=false <bc-container> cp1`, then
-   `docker start --checkpoint cp1 <bc-container>`.
-5. Pass/fail: does `GET /BC/ODataV4/Company` return 200, and does a *novel*
-   app still publish through the dev endpoint? Anything less is not a pass —
-   Patch #30 above looked fine on a boot check and was catastrophic.
+3. Write the six options above into `/etc/criu/runc.conf`; set the two sysctls.
+4. Run bc with `network_mode: host`.
+5. `docker checkpoint create --leave-running=false <bc> cp1`, then
+   `docker start --checkpoint cp1 <bc>`.
+6. Pass/fail: `GET /BC/ODataV4/Company` returns 200 **and** a *novel* app still
+   publishes through the dev endpoint. Anything less is not a pass.
+
+If you resume this, do it where `criu dump` runs interactively in seconds
+rather than five-minute CI round trips — a third of the runs here were spent on
+defects in the probe rather than on the question.
 
 ## 2. XLIFF translation parsing — ~10s CPU, plus an ~11s serializer-generation stall
 

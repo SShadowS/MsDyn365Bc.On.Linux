@@ -97,17 +97,36 @@ jobs:
       # boot check alone is not evidence (see Patch #30).
       VERIFY_PUBLISH: ${{ github.event_name != 'workflow_dispatch' && 'true' || inputs.verify_publish }}
       BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache
-      # criu is not in apt on ubuntu-24.04, so it gets built from source.
-      # "latest" resolves the newest release ON THE RUNNER: pinning v4.0 is what
-      # produced run 5's failure, since that release predates this kernel.
-      # Set an explicit tag (e.g. v4.0) to reproduce an older result.
-      CRIU_REF: latest
+      # THE criu VERSION WAS THE WHOLE BLOCKER. Runs 14-16: jammy's packaged
+      # 3.17 (2022) dumps BC fine and then segfaults the restored task, with no
+      # criu diagnostic beyond "killed by signal 11". Building v4.2.1 from
+      # source, changing nothing else, restored BC to a serving OData endpoint.
+      # Pinned rather than "latest" so the next experiment has one variable.
+      # v4.0 predates this kernel and fails differently (run 5).
+      CRIU_REF: v4.2.1
       # Run 9 restored into: bind-mount /proc/0/ns/net -> ...: no such file or
       # directory. That is libnetwork re-attaching the container's sandbox by
       # bind-mounting /proc/<init-pid>/ns/net, except on restore the init
       # process does not exist yet, so the pid is 0. Host networking removes the
       # namespace entirely, so there is nothing to rebuild.
       HOST_NETWORK: "true"
+      # busybox -> .NET -> BC ladder, ~60s before the BC boot. Written to tell a
+      # BC-specific restore failure apart from "criu cannot restore .NET here",
+      # which was the open question through run 15. Run 16 answered it (criu
+      # version), so this is off by default -- turn it on the next time a restore
+      # breaks and you need to know whether BC is even implicated.
+      RUN_CONTROLS: "false"
+      # glibc 2.35 registers an rseq area per thread and a mis-restored one
+      # segfaults the resumed task, which is what runs 14-16 looked like. It was
+      # NOT the cause: criu 4.2.1 restores BC with rseq left on. Kept as a lever
+      # rather than deleted, but off -- do not perturb a working configuration.
+      RSEQ_OFF: "false"
+      # THE question run 16 leaves open. Restore there had the same SQL container
+      # alive the whole time, so BC's ~17 pooled connections had a live peer.
+      # This severs them: sql is restarted between checkpoint and restore, so the
+      # restored NST wakes up holding handles to sockets whose peer is gone. That
+      # is the case CI actually needs, and it is strictly harder.
+      RESTART_SQL_BEFORE_RESTORE: "true"
 
     steps:
       - uses: actions/checkout@v4
@@ -202,9 +221,146 @@ jobs:
             && echo "docker checkpoint: available" \
             || echo "::warning::docker checkpoint subcommand unavailable"
 
+      # criu's runtime configuration, hoisted out of the checkpoint step so the
+      # control ladder below runs under EXACTLY the settings BC will get. Each
+      # option was unlocked by a specific failed run; see the checkpoint step.
+      - name: CRIU runtime configuration
+        run: |
+          set -e
+          sudo sysctl -w vm.overcommit_memory=1 vm.max_map_count=1048576
+          free -g | awk 'NR==2{print "  host RAM used/total: "$3"/"$2" GB"}'
+          sudo mkdir -p /etc/criu /tmp/criu-work && sudo chmod 777 /tmp/criu-work
+          printf 'tcp-established\ntcp-close\nfile-locks\next-unix-sk\nlink-remap\nghost-limit 512M\nwork-dir /tmp/criu-work\nlog-file criu.log\n' \
+            | sudo tee /etc/criu/runc.conf
+
+      # ── Gate 3: does checkpoint/restore work on this runner AT ALL? ───────
+      # Runs 7-16 only ever exercised BC, so a restore SIGSEGV had two possible
+      # readings and no way to tell them apart: docker+criu is broken on hosted
+      # runners, or BC specifically is. This ladder separates them for ~60s,
+      # BEFORE the three minutes of BC boot:
+      #
+      #   busybox  -- plain process, one thread. Fails => nothing about BC.
+      #   dotnet   -- .NET 8 runtime: JIT'd code, W^X double mapping, a GC
+      #               reserving huge virtual ranges, dozens of threads, rseq.
+      #               Fails => the blocker is .NET on criu, not this project's
+      #               patches, and no BC-side change can help.
+      #   BC       -- everything above plus 263 GB of reservations, ~17 pooled
+      #               SQL connections, and our JMP hooks.
+      #
+      # Whichever rung breaks first IS the answer. Not fatal: a broken rung is
+      # the finding, so let BC run anyway and report the whole ladder.
+      - name: Control checkpoint/restore ladder
+        id: controls
+        if: ${{ env.RUN_CONTROLS == 'true' }}
+        continue-on-error: true
+        run: |
+          set -u
+          # Mirrored to a file so the Verdict step can put the ladder in the run
+          # summary. A separate step reads it, so the async tee has exited by then.
+          exec > >(tee /tmp/ladder.out) 2>&1
+          echo "dotnet on runner: $(command -v dotnet || echo NONE) $(dotnet --version 2>/dev/null || true)"
+          # $1 name, $2 image, $3... command. Emits one verdict line per rung.
+          rung() {
+            local name=$1 image=$2; shift 2
+            local cn="ctl-$name" verdict
+            docker rm -f "$cn" >/dev/null 2>&1 || true
+            # Host networking, to match how bc is launched (see HOST_NETWORK).
+            docker run -d --name "$cn" --network host "$image" "$@" >/dev/null 2>&1 \
+              || { echo "RUNG $name: SKIP (container would not start)"; return; }
+            sleep 10
+            [ "$(docker inspect -f '{{.State.Status}}' "$cn")" = running ] \
+              || { echo "RUNG $name: SKIP (died before checkpoint)"; docker logs --tail 5 "$cn" 2>&1; return; }
+            if ! docker checkpoint create --leave-running=false "$cn" c 2>"/tmp/$name.dump.err"; then
+              echo "RUNG $name: DUMP FAILED"; sed -n 1,3p "/tmp/$name.dump.err"
+              sudo grep -hE 'Error \(' /tmp/criu-work/criu.log 2>/dev/null | tail -3
+              docker rm -f "$cn" >/dev/null 2>&1; return
+            fi
+            if ! docker start --checkpoint c "$cn" 2>"/tmp/$name.res.err"; then
+              echo "RUNG $name: RESTORE FAILED"; sed -n 1,3p "/tmp/$name.res.err"
+              sudo grep -hE 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -4
+              docker rm -f "$cn" >/dev/null 2>&1; return
+            fi
+            # `docker start` returning 0 is not proof of life -- assert the
+            # process is still running a few seconds later, the same way the BC
+            # steps refuse to trust an exit code alone.
+            sleep 5
+            verdict=$(docker inspect -f '{{.State.Status}}' "$cn")
+            [ "$verdict" = running ] \
+              && echo "RUNG $name: RESTORED AND ALIVE" \
+              || { echo "RUNG $name: RESTORED THEN DIED ($verdict)"; docker logs --tail 5 "$cn" 2>&1; }
+            docker rm -f "$cn" >/dev/null 2>&1 || true
+          }
+
+          rung busybox busybox:latest sh -c 'i=0; while :; do i=$((i+1)); sleep 1; done'
+
+          # Framework-dependent build on the runner, run in the runtime image:
+          # ~80 MB pull and no in-container SDK. The workload matters -- it must
+          # be allocating and JIT-ing at checkpoint time, not parked in a syscall,
+          # or it proves far less than it looks like it does.
+          mkdir -p /tmp/ctlapp && cd /tmp/ctlapp
+          cat > ctlapp.csproj <<'CSPROJ'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>disable</Nullable>
+              <AssemblyName>ctlapp</AssemblyName>
+            </PropertyGroup>
+          </Project>
+          CSPROJ
+          cat > Program.cs <<'CS'
+          using System.Diagnostics;
+          var sw = Stopwatch.StartNew();
+          for (int t = 0; t < 8; t++)
+              new Thread(() => { var r = new Random(); long acc = 0;
+                  while (true) { var b = new byte[64 * 1024]; r.NextBytes(b); acc += b[0];
+                      if (acc % 1000 == 0) GC.Collect(0); Thread.Sleep(1); } }) { IsBackground = true }.Start();
+          while (true) { Console.WriteLine($"alive {sw.Elapsed.TotalSeconds:F0}s"); Thread.Sleep(2000); }
+          CS
+          if dotnet publish -c Release -o out --nologo -v q >/dev/null 2>&1; then
+            cd "$GITHUB_WORKSPACE"
+            docker rm -f ctl-dotnet >/dev/null 2>&1 || true
+            [ "${RSEQ_OFF:-false}" = "true" ] && TUNABLES=glibc.pthread.rseq=0 || TUNABLES=
+            docker run -d --name ctl-dotnet --network host \
+              -v /tmp/ctlapp/out:/app:ro -w /app \
+              -e DOTNET_EnableWriteXorExecute=0 \
+              -e GLIBC_TUNABLES="$TUNABLES" \
+              mcr.microsoft.com/dotnet/runtime:8.0 dotnet /app/ctlapp.dll >/dev/null 2>&1 || true
+            sleep 10
+            if [ "$(docker inspect -f '{{.State.Status}}' ctl-dotnet 2>/dev/null)" = running ]; then
+              if ! docker checkpoint create --leave-running=false ctl-dotnet c 2>/tmp/dotnet.dump.err; then
+                echo "RUNG dotnet: DUMP FAILED"; sed -n 1,3p /tmp/dotnet.dump.err
+              elif ! docker start --checkpoint c ctl-dotnet 2>/tmp/dotnet.res.err; then
+                echo "RUNG dotnet: RESTORE FAILED"; sed -n 1,3p /tmp/dotnet.res.err
+                sudo grep -hE 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -4
+              else
+                sleep 5
+                if [ "$(docker inspect -f '{{.State.Status}}' ctl-dotnet)" = running ]; then
+                  echo "RUNG dotnet: RESTORED AND ALIVE"
+                  echo "  post-restore output: $(docker logs --tail 2 ctl-dotnet 2>&1 | tr '\n' ' ')"
+                else
+                  echo "RUNG dotnet: RESTORED THEN DIED"
+                  docker logs --tail 5 ctl-dotnet 2>&1
+                fi
+              fi
+            else
+              echo "RUNG dotnet: SKIP (container not running before checkpoint)"
+            fi
+            docker rm -f ctl-dotnet >/dev/null 2>&1 || true
+          else
+            echo "RUNG dotnet: SKIP (publish failed)"
+          fi
+          cd "$GITHUB_WORKSPACE"
+
       - name: Host networking (removes the netns docker cannot rebuild)
         if: ${{ env.HOST_NETWORK == 'true' }}
         run: |
+          # Left as a compose interpolation, not expanded by this shell, so the
+          # value has to exist in the environment of every later compose call.
+          [ "${RSEQ_OFF:-false}" = "true" ] && V=glibc.pthread.rseq=0 || V=
+          echo "GLIBC_TUNABLES_VALUE=$V" >> "$GITHUB_ENV"
+          echo "GLIBC_TUNABLES for bc: '${V:-<unset>}'"
           # COMPOSE_FILE means every later bare `docker compose` picks this up
           # without touching the steps themselves.
           cat > override-host.yml <<'YAML'
@@ -222,6 +378,9 @@ jobs:
                 # managed frames. Turning it off costs a little JIT throughput
                 # and nothing else.
                 DOTNET_EnableWriteXorExecute: "0"
+                # See RSEQ_OFF at the job level for why. Empty when disabled,
+                # which glibc treats the same as unset.
+                GLIBC_TUNABLES: "${GLIBC_TUNABLES_VALUE}"
           YAML
           echo "COMPOSE_FILE=docker-compose.yml:override-host.yml" >> "$GITHUB_ENV"
           # bridge DNS ("sql") is gone with host networking, so BC reaches SQL on
@@ -281,7 +440,9 @@ jobs:
           # `docker checkpoint create` exposes no flag for it, and run 7 proved
           # that is the exact wall: BC's ~17 pooled connections to SQL make criu
           # refuse with "Connected TCP socket, consider using --tcp-established".
-          sudo mkdir -p /etc/criu
+          # /etc/criu/runc.conf and the sysctls are written by the "CRIU runtime
+          # configuration" step above, so the control ladder runs under the same
+          # settings. What each option is for:
           # Each option criu asks for unlocks the next barrier, and a run costs
           # ~5 minutes, so set the whole set it typically needs rather than
           # discovering them one per run:
@@ -302,11 +463,6 @@ jobs:
           # of address-space reservations is precisely what the heuristic
           # overcommit mode refuses and what exhausts the default 65530 mapping
           # cap, and criu must recreate every one of them.
-          sudo sysctl -w vm.overcommit_memory=1 vm.max_map_count=1048576
-          free -g | awk 'NR==2{print "  host RAM used/total: "$3"/"$2" GB"}'
-          sudo mkdir -p /tmp/criu-work && sudo chmod 777 /tmp/criu-work
-          printf 'tcp-established\ntcp-close\nfile-locks\next-unix-sk\nlink-remap\nghost-limit 512M\nwork-dir /tmp/criu-work\nlog-file criu.log\n' \
-            | sudo tee /etc/criu/runc.conf
           echo "criu on PATH: $(command -v criu || echo NONE)"
           echo "dockerd sees: $(sudo docker info 2>/dev/null | grep -iE 'runtime|storage driver' | tr '\n' ' ')"
           if ! docker checkpoint create --leave-running=false "$CID" cp1 2>checkpoint.err; then
@@ -355,6 +511,31 @@ jobs:
           sudo du -sh "/var/lib/docker/containers/$CID/checkpoints/cp1" 2>/dev/null \
             || sudo find /var/lib/docker -maxdepth 6 -name cp1 -type d -exec du -sh {} \; 2>/dev/null \
             || echo "(checkpoint dir not located — size unknown)"
+
+      # Run 16 restored BC against the SAME live SQL container, which is the easy
+      # case and was never the interesting one: `tcp-close` in runc.conf means
+      # criu closes the pooled connections instead of repairing them, so what is
+      # actually being tested is whether ADO.NET reconnects on first use after
+      # resume. Restarting sql here makes that real -- new sockets, new peer,
+      # same data (the tmpfs survives a restart because the container is not
+      # recreated). A fully fresh sql container additionally needs the database
+      # restored into it, which is the entrypoint's job and does not run on a
+      # resumed process; that is a separate experiment.
+      - name: Restart SQL so the restored BC has no live peer
+        id: sqlrestart
+        if: ${{ steps.checkpoint.outcome == 'success' && env.RESTART_SQL_BEFORE_RESTORE == 'true' }}
+        run: |
+          set -e
+          docker compose restart sql
+          for i in $(seq 1 60); do
+            [ "$(docker compose ps --format '{{.Health}}' sql 2>/dev/null)" = healthy ] && break
+            sleep 2
+          done
+          H=$(docker compose ps --format '{{.Health}}' sql 2>/dev/null)
+          echo "sql health after restart: ${H:-unknown}"
+          [ "$H" = healthy ] || { echo "::error::sql did not come back — the restore result would be meaningless"; exit 1; }
+          # Falsifiable: a restart that preserved the sockets would prove nothing.
+          echo "sql container started at: $(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q sql)")"
 
       - name: Restore from the checkpoint
         id: restore
@@ -473,14 +654,31 @@ jobs:
             echo "|---|---|"
             echo "| cold boot to healthy | ${{ steps.boot.outputs.cold_boot }}s |"
             echo "| checkpoint | ${{ steps.checkpoint.outcome }} (${{ steps.checkpoint.outputs.checkpoint_s }}s) |"
+            echo "| sql restarted before restore | ${{ steps.sqlrestart.outcome }} |"
             echo "| restore | ${{ steps.restore.outcome }} (${{ steps.restore.outputs.restore_s }}s, OData ${{ steps.restore.outputs.odata }}) |"
             echo "| post-restore health | ${{ steps.health.outcome }} |"
             echo "| novel app publish | ${{ steps.publish.outcome }} |"
             echo
+            # The ladder is the part that says whether a BC failure is even about
+            # BC, so it belongs in the summary and not 1700 log lines down.
+            if [ -s /tmp/ladder.out ]; then
+              echo "**Control ladder** (busybox -> .NET -> BC; first broken rung is the answer):"
+              echo '```'
+              grep -E '^RUNG |^  ' /tmp/ladder.out || cat /tmp/ladder.out
+              echo '```'
+              echo
+            fi
             echo "This runner is ephemeral, so these timings do NOT show the win —"
-            echo "that only exists where the checkpoint survives between jobs. Restore"
-            echo "here also had the SAME SQL container alive, which is the easy case;"
-            echo "restoring against a fresh SQL container is strictly harder."
+            echo "that only exists where the checkpoint survives between jobs, and"
+            echo "moving a ~2.1 GB checkpoint payload there is its own problem."
+            if [ "${{ steps.sqlrestart.outcome }}" = "success" ]; then
+              echo "SQL was restarted between checkpoint and restore, so BC resumed with"
+              echo "its pooled connections' peer gone. A fully fresh SQL container also"
+              echo "needs the database restored into it — still untested."
+            else
+              echo "Restore had the SAME SQL container alive throughout, which is the"
+              echo "easy case; severing those connections is strictly harder."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${{ steps.checkpoint.outputs.classification }}" = "tcp-sockets" ]; then

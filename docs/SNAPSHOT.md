@@ -60,7 +60,7 @@ flag because the directory has to exist and be writable for the feature to work
 at all, so anything else would be a second source of truth that can disagree
 with the first. Nothing creates it for you.
 
-**2. Install the prerequisites** below. `scripts/snapshot.sh preflight` tells you
+**2. Install the prerequisites** with `scripts/setup-snapshot-host.sh`. `scripts/snapshot.sh preflight` tells you
 which are missing, and `status` tells you whether this machine is on:
 
 ```
@@ -74,15 +74,11 @@ retire the disk space as well, delete the store's contents.
 ## Prerequisites and the run loop
 
 ```bash
-# 1. Host prerequisites (once)
-sudo apt-get install -y build-essential libprotobuf-dev libprotobuf-c-dev \
-  protobuf-c-compiler protobuf-compiler python3-protobuf libnl-3-dev libnet-dev \
-  libcap-dev libbsd-dev libgnutls28-dev libnftables-dev
-git clone --depth 1 --branch v4.2.1 https://github.com/checkpoint-restore/criu /tmp/criu
-make -C /tmp/criu -j"$(nproc)" && sudo make -C /tmp/criu install-criu
-
-echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
-sudo systemctl restart docker
+# 1. Host prerequisites (once). Idempotent; --check reports without changing
+#    anything, and it asks before restarting docker because that stops every
+#    container on the machine.
+scripts/setup-snapshot-host.sh --check
+scripts/setup-snapshot-host.sh
 
 # 2. Every run. No BC_SNAPSHOT_DIR here — the machine already declared it.
 export COMPOSE_FILE=docker-compose.yml:docker-compose.snapshot.yml

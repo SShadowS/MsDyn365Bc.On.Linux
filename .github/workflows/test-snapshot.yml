@@ -50,10 +50,17 @@ concurrency:
 
 jobs:
   snapshot:
-    # NOT ubuntu-latest. Its 6.17-azure kernel makes criu fail parsing its own
-    # vDSO (kerndat_vdso_fill_symtable) before it touches any process, so the
-    # leg costs three minutes to learn nothing. 6.8-azure works.
-    runs-on: ubuntu-22.04
+    # Set the repository variable BENCH_RUNNER to "self-hosted" (or a JSON array
+    # of labels) to run this on your own machine, which is the only place the
+    # wall-clock win exists — a hosted runner throws the store away.
+    # A variable rather than a workflow_dispatch input because dispatch inputs
+    # only register for workflows on the DEFAULT branch, and this file is not
+    # there yet; the push trigger has no such restriction.
+    #
+    # The hosted default is NOT ubuntu-latest: its 6.17-azure kernel makes criu
+    # fail parsing its own vDSO before it touches any process, so that leg costs
+    # three minutes to learn nothing. 6.8-azure works.
+    runs-on: ${{ vars.BENCH_RUNNER && (startsWith(vars.BENCH_RUNNER, '[') && fromJSON(vars.BENCH_RUNNER) || vars.BENCH_RUNNER) || 'ubuntu-22.04' }}
     timeout-minutes: 45
     env:
       BC_VERSION: ${{ inputs.bc_version || '28.1' }}
@@ -62,7 +69,12 @@ jobs:
       # Must be a HOST directory: snapshot.sh keys on the resolved artifact urls
       # in its stamp, which is not readable from inside a named volume.
       BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache
-      BC_SNAPSHOT_DIR: ${{ github.workspace }}/snapshot-store
+      # Only pinned on a hosted runner, where nothing survives anyway. On a real
+      # machine this is left UNSET on purpose so scripts/snapshot.sh resolves the
+      # machine-level store (/var/cache/bc-linux/snapshots or ~/.cache/...) —
+      # which is what makes the snapshot outlive the job, and exercises the
+      # per-machine opt-in rather than bypassing it.
+      BC_SNAPSHOT_DIR: ${{ runner.environment == 'github-hosted' && format('{0}/snapshot-store', github.workspace) || '' }}
       BC_SNAPSHOT_SQLDIR: /tmp/sqlsnap
       COMPOSE_FILE: docker-compose.yml:docker-compose.snapshot.yml
       # 3.17 (what jammy packages) dumps BC perfectly and segfaults the restored
@@ -85,7 +97,43 @@ jobs:
           ./scripts/test-snapshot-key.sh
           shellcheck -S warning -e SC2034 scripts/snapshot.sh
 
-      - name: Install criu and enable docker experimental
+      # On a hosted runner this VM is thrown away, so installing criu and
+      # flipping the docker daemon into experimental mode costs nothing.
+      # On YOUR machine both are intrusive, and the original version of this step
+      # was actively destructive: it overwrote /etc/docker/daemon.json wholesale
+      # (taking any registry mirrors, storage-driver or logging config with it)
+      # and restarted the daemon, killing every running container.
+      #
+      # So: if the host is already capable, do nothing at all. If it is not and
+      # this is a real machine, say what is missing and stop. Only ever modify an
+      # ephemeral hosted runner — and even there, MERGE into daemon.json rather
+      # than replacing it.
+      - name: Host capability
+        id: hostcap
+        run: |
+          if ./scripts/snapshot.sh preflight 2>&1; then
+            echo "host is already set up — changing nothing"
+            exit 0
+          fi
+          if [ "${{ runner.environment }}" != "github-hosted" ]; then
+            {
+              echo "### This machine is not set up for snapshot mode"
+              echo
+              echo "Nothing was modified. See docs/SNAPSHOT.md — you need criu >= 4.2.1,"
+              echo '`{"experimental": true}` in /etc/docker/daemon.json, and a snapshot'
+              echo "store directory, e.g.:"
+              echo
+              echo '```bash'
+              echo 'sudo install -d -o "$(id -u)" -m 755 /var/cache/bc-linux/snapshots'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::host not set up for snapshots and this is not an ephemeral runner — refusing to modify it"
+            exit 1
+          fi
+          echo "setup=needed" >> "$GITHUB_OUTPUT"
+
+      - name: Install criu and enable docker experimental (ephemeral runners only)
+        if: steps.hostcap.outputs.setup == 'needed'
         run: |
           set -e
           sudo apt-get update -qq
@@ -103,7 +151,11 @@ jobs:
           sudo criu check 2>&1 | tee criu-check.out || true
           grep -qE 'kerndat|vdso|Could not initialize kernel features' criu-check.out \
             && { echo "::error::criu cannot initialise on kernel $(uname -r)"; exit 1; } || true
-          echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
+          # MERGE, never replace. Even on a throwaway VM the runner image ships a
+          # daemon.json, and clobbering it is a habit that eventually runs
+          # somewhere it matters.
+          sudo test -f /etc/docker/daemon.json || echo '{}' | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo python3 -c "import json; p='/etc/docker/daemon.json'; cfg=json.load(open(p)); cfg['experimental']=True; json.dump(cfg, open(p,'w'), indent=2); print('daemon.json now:', cfg)"
           sudo systemctl restart docker
           for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
 
@@ -236,8 +288,13 @@ jobs:
             echo "Containers were removed between create and restore, so the restore ran"
             echo "against nothing but the snapshot and the persisted volumes."
             echo
-            echo "This runner is ephemeral, so the numbers do not show the win — that only"
-            echo "exists where the store survives between jobs. See docs/SNAPSHOT.md."
+            if [ "${{ runner.environment }}" = "github-hosted" ]; then
+              echo "This runner is ephemeral, so the numbers do not show the win — that only"
+              echo "exists where the store survives between jobs. See docs/SNAPSHOT.md."
+            else
+              echo "Self-hosted: the store survives this job, so the NEXT run should report a"
+              echo "cold boot it never pays. Run scripts/bench-snapshot.sh for medians."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Diagnostics on failure

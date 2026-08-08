@@ -61,11 +61,26 @@ fi
 # snapshot.sh needs sudo for the sysctls, /etc/criu/runc.conf, and the
 # root-owned checkpoint the daemon writes. A password prompt inside a CI job
 # hangs the job rather than failing it, so this is worth checking explicitly.
-if sudo -n true 2>/dev/null; then
-  ok "passwordless sudo"
+# `sudo -n true` alone is a FALSE PASS in an interactive shell: sudo caches a
+# timestamp for a few minutes after you type a password, so it succeeds without
+# proving any policy. -k drops that cache first, which is what a CI job's fresh
+# session actually faces. The cost is that your next sudo will ask again.
+SUDO_OK=0
+if sudo -n -k true 2>/dev/null; then
+  SUDO_OK=1
+  ok "passwordless sudo (verified with a cleared timestamp)"
 else
-  bad "sudo asks for a password — a self-hosted runner job would hang on it"
-  echo "        consider: echo '$(id -un) ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/$(id -un)"
+  bad "sudo requires a password — a runner job HANGS on the prompt rather than failing"
+  echo "        snapshot.sh needs root for the sysctls, /etc/criu/runc.conf and the"
+  echo "        root-owned checkpoint the docker daemon writes."
+  echo
+  echo "        printf '%s ALL=(ALL) NOPASSWD:ALL\\n' \"$(id -un)\" | sudo tee /etc/sudoers.d/bc-linux"
+  echo "        sudo chmod 0440 /etc/sudoers.d/bc-linux"
+  echo
+  echo "        A narrower rule is not really narrower: the list is sysctl, mkdir,"
+  echo "        tee, chmod, cp, rm, du, grep and criu, i.e. most of coreutils as"
+  echo "        root. And membership of the docker group -- which this user already"
+  echo "        has -- is root-equivalent anyway, so this grants little that is new."
   NEED=1
 fi
 
@@ -114,7 +129,12 @@ fi
 
 # criu can be installed and still unable to run: on some kernels it cannot parse
 # its own vDSO and fails before touching any process. Better to find out now.
-if command -v criu >/dev/null; then
+if command -v criu >/dev/null && [ "$SUDO_OK" = 0 ]; then
+  # Do not blame criu for a sudo problem. The first self-hosted run reported
+  # "criu check failed" with no error lines at all, because sudo had exited
+  # non-zero for want of a password and criu never ran.
+  todo "skipping criu check — it needs sudo, which is not passwordless here"
+elif command -v criu >/dev/null; then
   # Judge this by criu's EXIT CODE, not by grepping its output. `criu check`
   # prints "Warn (criu/kerndat.c:...): Can't load /run/criu.kdat" on every first
   # run — the kdat cache simply does not exist yet — and an earlier version of
@@ -125,8 +145,14 @@ if command -v criu >/dev/null; then
     ok "criu check passes on kernel $(uname -r)"
   else
     bad "criu check failed on kernel $(uname -r):"
-    echo "$CRIU_CHECK_OUT" | grep -E '^(Error|Warn)' | tail -8 | sed 's/^/        /'
-    echo "        (full output: sudo criu check)"
+    # Fall back to the raw tail when nothing matches Error/Warn. Printing a
+    # filtered view that comes out EMPTY is worse than printing nothing --
+    # it reads as "no reason given" when the reason was there all along.
+    if echo "$CRIU_CHECK_OUT" | grep -qE '^(Error|Warn)'; then
+      echo "$CRIU_CHECK_OUT" | grep -E '^(Error|Warn)' | tail -8 | sed 's/^/        /'
+    else
+      echo "$CRIU_CHECK_OUT" | tail -8 | sed 's/^/        /'
+    fi
     if echo "$CRIU_CHECK_OUT" | grep -qiE 'vdso|kerndat_vdso'; then
       echo "        This is the vDSO-parsing failure. It is NOT about kernel age --"
       echo "        criu 4.2.1 checks clean on Arch 7.1.4 and fails on 6.17-azure --"

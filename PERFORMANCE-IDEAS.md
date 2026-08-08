@@ -112,6 +112,40 @@ Not attempted here: this session ran on a Firecracker microVM whose kernel has
 level and `docker checkpoint` (which sits on CRIU) is unavailable with it.
 Stock Ubuntu hosts have the option enabled and `criu` in universe.
 
+### Probed on GitHub-hosted runners, 2026-08-08 — the wall is the SQL socket pool
+
+`.github/workflows/probe-criu.yml` ran this end to end. Results, so nobody
+repeats the dead ends:
+
+| runner | kernel | criu | outcome |
+|---|---|---|---|
+| ubuntu-latest | 6.17.0-azure | 4.0 and newest tag, from source | **unusable** — criu cannot parse its own vDSO (`kerndat_vdso_fill_symtable`), fails before touching any process |
+| ubuntu-22.04 | 6.8.0-azure | from apt (in universe) | criu initialises, BC boots in 109s, dump reaches BC and **fails on established TCP** |
+
+The 22.04 dump log names it exactly:
+
+```
+Error (criu/sk-inet.c:189): inet: Connected TCP socket, consider using --tcp-established option.
+Error (criu/cr-dump.c:1361): Dump files (pid: 5383) failed with -1
+Error (criu/cr-dump.c:1781): Dumping FAILED.
+```
+
+So **BC was never the problem** — the blocker is the ~17 pooled connections to
+SQL, precisely as predicted from the socket count above. Checkpoint payload
+measured 2.16 GB on the runner, matching the 1.80 GB measured locally.
+
+`docker checkpoint create` has no flag for `--tcp-established`, but runc reads
+`/etc/criu/runc.conf` (the dump log says so: "Would overwrite RPC settings with
+values from /etc/criu/runc.conf"), so the option is reachable by writing
+`tcp-established` into that file before checkpointing. That is the next thing
+to try, and the probe now does.
+
+Two cautions if you pick this up. `--tcp-established` makes the DUMP succeed;
+RESTORE still needs a peer whose sequence numbers match, so restoring against a
+fresh SQL container remains the hard, untested case. And a hosted runner is
+ephemeral, so none of this measures the win — that only exists where the
+checkpoint survives between jobs.
+
 The decisive probe, in order — if step 4 fails, stop, the design is dead:
 
 1. Host with `CONFIG_CHECKPOINT_RESTORE=y`; `apt-get install criu`;

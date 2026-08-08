@@ -76,7 +76,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-22.04]
+        # ubuntu-latest (6.17-azure) is REMOVED, not forgotten: criu 4.0 and the
+        # newest tag both fail there parsing their own vDSO
+        # (kerndat_vdso_fill_symtable), so the leg costs 3 minutes to learn
+        # nothing. 22.04 (6.8-azure) has criu in apt and reaches the checkpoint.
+        runner: [ubuntu-22.04]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
@@ -228,6 +232,14 @@ jobs:
           set -e
           CID="${{ steps.boot.outputs.cid }}"
           T0=$(date +%s)
+          # runc invokes criu and reads /etc/criu/runc.conf -- the dump log says
+          # "Would overwrite RPC settings with values from /etc/criu/runc.conf".
+          # That is the only way to reach --tcp-established, since
+          # `docker checkpoint create` exposes no flag for it, and run 7 proved
+          # that is the exact wall: BC's ~17 pooled connections to SQL make criu
+          # refuse with "Connected TCP socket, consider using --tcp-established".
+          sudo mkdir -p /etc/criu
+          printf 'tcp-established\ntcp-close\n' | sudo tee /etc/criu/runc.conf
           echo "criu on PATH: $(command -v criu || echo NONE)"
           echo "dockerd sees: $(sudo docker info 2>/dev/null | grep -iE 'runtime|storage driver' | tr '\n' ' ')"
           if ! docker checkpoint create --leave-running=false "$CID" cp1 2>checkpoint.err; then

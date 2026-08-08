@@ -157,12 +157,13 @@ a tmpfs with under 4 GB free. To clear it by hand:
 scripts/snapshot.sh reap
 ```
 
-**Measure it from a container, not from your shell.** A `-v` source path is
-resolved by the daemon, so `docker run --rm -v /tmp:/t:ro busybox df -Ph /t`
-reports the filesystem that actually fills. A CI job — or anything else with a
-private `/tmp` — sees a different one: in run 12 the job's `df` reported 1.1 TB
-free on btrfs while the daemon's 16 GB tmpfs was full, and that reading was
-used to wrongly rule out the tmpfs as the cause.
+**Check the `Mounted on` column, and prefer the daemon's view.** A `-v` source
+path is resolved by the daemon, so `docker run --rm -v /tmp:/t:ro busybox df -Ph
+/t` always reports the filesystem that actually fills, whether or not the caller
+shares it. On the machine measured here the two agree — a self-hosted runner's
+`/tmp` is the host's — and the reading that appeared to rule out the tmpfs was
+simply `df -Ph / /tmp /var/tmp /var/cache/bc-linux` with its rows attributed to
+the wrong arguments. Passing one path at a time removes the ambiguity.
 
 The same reasoning is why this project's own staging (`/var/tmp/bc-sqlstage`,
 `/var/tmp/criu-work`) is under `/var/tmp` and why `setup-snapshot-host.sh`

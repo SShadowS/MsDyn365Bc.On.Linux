@@ -554,12 +554,22 @@ create() {
   # into a no-op.
   _reap_ctrd_staging
   _check_space || die "not enough free space to take a snapshot"
-  local odata; odata=$(_bc_odata)
+  # A BOUNDED WAIT, not a single sample. Run 14 died here: the benchmark's own
+  # probe saw 200 and one second later this check saw 503, throwing away a
+  # 40-minute run over one reading. BC does briefly stop answering after it
+  # first serves — the container was "running (starting)" at that moment — so a
+  # snapshot attempt landing in that window is normal, not a reason to fail.
+  # Still refuses eventually: a BC that never recovers must not be captured,
+  # because the checkpoint would reproduce the broken state on every restore.
+  local odata i
+  for i in $(seq 1 "${BC_SNAPSHOT_READY_TRIES:-60}"); do
+    odata=$(_bc_odata)
+    [ "$odata" = "200" ] && break
+    [ "$i" = 1 ] && log "bc answered HTTP $odata — waiting for it to settle before snapshotting"
+    sleep 5
+  done
   if [ "$odata" != "200" ]; then
-    log "bc is not serving OData (HTTP $odata) — refusing to snapshot an unhealthy BC"
-    # The caller's own readiness probe had just passed against the same URL on
-    # the host, so the disagreement itself is the clue: a different container
-    # answering the host port, or exec failing rather than curl.
+    log "bc is not serving OData (HTTP $odata) after $(( ${BC_SNAPSHOT_READY_TRIES:-60} * 5 ))s — refusing to snapshot an unhealthy BC"
     _odata_diagnosis
     die "bc not healthy at snapshot time"
   fi

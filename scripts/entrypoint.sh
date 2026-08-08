@@ -168,8 +168,16 @@ STEP2_START=$(date +%s)
 # The image half of the key is StartupHook.dll's size+mtime: docker gives every
 # file in a rebuilt layer a fresh mtime, so it changes exactly when the image
 # does, and reading it costs one stat.
+# The third component is the config fingerprint. Step 2 seds SQL_SERVER,
+# BC_DB_USER and BC_DB_PASSWORD into CustomSettings.config, so a volume that
+# skips Step 2 keeps whatever credentials the FIRST boot was given — change
+# BC_DB_PASSWORD and the warm boot authenticates with the old one while Step 3
+# creates the login with the new one. Hashed, not stored plaintext: the config
+# in this volume already holds the password, but a stamp file is no place to
+# copy it to. Everything else Step 2 writes is a constant.
 SERVICE_STAMP_FILE="$SERVICE_DIR/.bc-service-stamp"
-SERVICE_STAMP="v1|platform=$PLATFORM_VERSION|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)"
+SERVICE_CONFIG_FP=$(printf '%s|%s|%s' "$SQL_SERVER" "$BC_DB_USER" "$BC_DB_PASSWORD" | md5sum | cut -c1-12)
+SERVICE_STAMP="v1|platform=$PLATFORM_VERSION|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)|config=$SERVICE_CONFIG_FP"
 if [ -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ] && \
    [ "$(cat "$SERVICE_STAMP_FILE" 2>/dev/null || true)" != "$SERVICE_STAMP" ]; then
     log_step "Service tier in the volume was built by a different platform/image — rebuilding it"

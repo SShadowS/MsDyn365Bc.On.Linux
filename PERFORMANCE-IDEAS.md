@@ -44,12 +44,35 @@ assembly cache — the `{RuntimePackageId}_<N>_Merkle.json` files the entrypoint
 pre-seed already writes. So **persisting the assembly cache buys compile time
 and pays it partly back in hash validation.**
 
-In a pipeline this is integrity-checking bytes we produced ourselves, seconds
-earlier, in a container we control. A JMP hook forcing `MerkleProof.IsValid`
-to return true is squarely in this repo's idiom (cf. Patch #21, #23). It must
-be **env-gated and default off** — skipping validation against a genuinely
-stale cache means loading wrong assemblies, which is exactly the failure mode
-the stamping in CLAUDE.md exists to prevent. Not implemented.
+### Tried it. It is 10x WORSE. Do not retry.
+
+The obvious move is a JMP hook forcing `MerkleProof.IsValid` to return true.
+Implemented as an opt-in Patch #30, measured, and reverted (commit b99383d and
+its revert). Interleaved runs, same container, only the env var changing:
+
+| | total | NST | dev endpoint |
+|---|---|---|---|
+| validation ON (normal) | 96s | 85s | HTTP 401, healthy |
+| validation SKIPPED | **913s** | **903s** | **HTTP 000, never healthy** |
+
+**The validation result is not a checkbox — it selects BC's loading strategy.**
+With the hook on, BC accepts cache entries whose proofs would have failed, then
+fails to load them and falls back:
+
+```
+CLR type load failed -- Assembly: F2B3AE52321A9D8D...                        x10
+Switching from OneApplicationMultipleAssemblies to OneApplicationObjectOneAssembly  x8
+Loading assembly into the Neither context from path /usr/share/Microsoft/... x8
+```
+
+`OneApplicationMultipleAssemblies` is the fast bulk path; the fallback loads
+per application object. So the hashing is doing useful triage — it tells BC
+which cached assemblies it can bulk-load and which must be rebuilt, and paying
+29s to avoid that fallback is a bargain, not waste.
+
+The corollary matters for anything else in this file: **time spent in the
+assembly cache path is not automatically removable.** Measure the end state,
+not just the phase you shortened.
 
 ## 2. XLIFF translation parsing — ~10s CPU, plus an ~11s serializer-generation stall
 

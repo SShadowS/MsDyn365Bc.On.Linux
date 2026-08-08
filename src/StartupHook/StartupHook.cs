@@ -128,24 +128,6 @@ using System.Threading.Tasks;
 ///   Linux topology proxy forces false).
 ///   Fix: return null, which is what the gated-off path produced. Applied on all versions.
 ///
-/// Patch #30: SimpleMerkleTree.MerkleProof.IsValid (Nav.Ncl.dll) — OPT-IN, OFF BY DEFAULT
-///   Not a correctness fix: a pipeline-only speed knob, enabled with
-///   BC_SKIP_MERKLE_VALIDATION=1.
-///   BC verifies its ReadyToRun assembly cache with SHA-256 Merkle proofs at every
-///   startup. Profiling BC 28.1 (see PERFORMANCE-IDEAS.md, "NST STARTUP profile")
-///   put 29.2s of the main thread's blocked time, and 245.9s of aggregate thread
-///   time under Parallel.For, in exactly one call path:
-///     SimpleMerkleTree.IsValidInput -> MerkleProof.IsValid -> CombineHash -> SHA256.
-///   In CI that is integrity-checking bytes this same container produced seconds
-///   earlier, so the check buys nothing and costs a large share of boot.
-///   Fix: hook IsValid to return true. Parameterless instance method returning bool,
-///   which is the shape JMP hooks handle most cleanly.
-///   DANGER: with a genuinely stale or corrupt assembly cache this loads the wrong
-///   assemblies instead of rejecting them. It is off unless asked for, and it is the
-///   reason /bc/assembly-cache is stamped with platform + image — the stamp becomes
-///   the only thing standing between a stale cache and BC when this is on. Do not
-///   enable it for an interactive or production instance.
-///
 /// JMP hooks work ONLY on BC methods (JIT-compiled). BCL methods are ReadyToRun pre-compiled
 /// and cannot be patched this way.
 ///
@@ -366,7 +348,6 @@ internal class StartupHook
         if (name == "Microsoft.Dynamics.Nav.Ncl")
         {
             PatchALDatabaseALSid(args.LoadedAssembly);
-            PatchMerkleValidation(args.LoadedAssembly);
             // Patch #19: Set CustomReportingServiceClient to no-op factory.
             //   BC's Reporting Service is a Windows PE binary that can't run on Linux.
             //   When test code triggers RDLC rendering, BC tries to connect to the
@@ -2601,57 +2582,6 @@ internal class StartupHook
     }
 
     // ========================================================================
-    // ========================================================================
-    // Patch #30: SimpleMerkleTree.MerkleProof.IsValid — skip R2R cache verification.
-    // OPT-IN via BC_SKIP_MERKLE_VALIDATION=1. See the header for why, and for why
-    // you should not turn it on outside a pipeline.
-    // ========================================================================
-
-    private static void PatchMerkleValidation(Assembly navNcl)
-    {
-        if (Environment.GetEnvironmentVariable("BC_SKIP_MERKLE_VALIDATION") != "1")
-            return;
-
-        try
-        {
-            var proofType = navNcl.GetType(
-                "Microsoft.Dynamics.Nav.Runtime.Apps.SimpleMerkleTree+MerkleProof");
-            if (proofType == null)
-            {
-                Console.WriteLine("[StartupHook] Patch #30: SimpleMerkleTree+MerkleProof not found — skipping");
-                return;
-            }
-
-            var isValid = proofType.GetMethod("IsValid",
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-                null, Type.EmptyTypes, null);
-            if (isValid == null)
-            {
-                Console.WriteLine("[StartupHook] Patch #30: MerkleProof.IsValid() not found — skipping");
-                return;
-            }
-
-            var replacement = typeof(StartupHook).GetMethod(
-                nameof(Replacement_MerkleIsValid),
-                BindingFlags.Static | BindingFlags.NonPublic)!;
-            ApplyJmpHook(isValid, replacement, "SimpleMerkleTree.MerkleProof.IsValid");
-            Console.WriteLine("[StartupHook] Patch #30: Merkle proof validation DISABLED "
-                            + "(BC_SKIP_MERKLE_VALIDATION=1) — assembly cache is trusted unverified");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[StartupHook] Patch #30 failed: {ex.GetType().Name}: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Replacement for MerkleProof.IsValid(). The original is an instance method taking
-    /// no arguments and returning bool; a parameterless static returning true is
-    /// call-compatible because the hidden `this` arrives in a register the replacement
-    /// simply never reads.
-    /// </summary>
-    private static bool Replacement_MerkleIsValid() => true;
-
     // Patch #21: NavOpenTaskPageAction.ShowForm — no-op on headless Linux runner.
     //
     // When a test method opens a task page, ShowForm is called on the headless

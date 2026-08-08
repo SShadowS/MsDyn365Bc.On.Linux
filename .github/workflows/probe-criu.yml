@@ -139,8 +139,13 @@ jobs:
 
           sudo add-apt-repository -y universe >/dev/null 2>&1 || true
           sudo apt-get update -qq
-          if sudo apt-get install -y -qq criu; then
-            echo "criu: installed from apt"
+          # jammy packages criu 3.17 (2022). rseq support landed in that very
+          # release and has been fixed repeatedly since; glibc 2.35 registers
+          # rseq on every thread, and a mismatched rseq area segfaults a restored
+          # task exactly the way runs 14 and 15 did. So prefer source unless
+          # CRIU_FROM_SOURCE is turned off.
+          if [ "${CRIU_FROM_SOURCE:-true}" != "true" ] && sudo apt-get install -y -qq criu; then
+            echo "criu: installed from apt ($(criu --version 2>&1 | head -1))"
           else
             echo "::warning::criu not in apt on this runner — building ${CRIU_REF} from source"
             sudo apt-get install -y -qq build-essential git pkg-config \
@@ -372,9 +377,13 @@ jobs:
             # Run 11: the assumed path was empty. After --leave-running=false the
             # container is exited, so containerd's task dir is gone or transient.
             # Search instead of assuming -- any criu log touched in the last 5 min.
-            echo "--- criu work-dir log (survives the task dir teardown) ---"
+            echo "--- criu work-dir log: errors ---"
             sudo grep -E "Error \(|Warn \(" /tmp/criu-work/criu.log 2>/dev/null | tail -20 \
-              || sudo tail -30 /tmp/criu-work/criu.log 2>/dev/null || echo "(no /tmp/criu-work/criu.log)"
+              || echo "(no /tmp/criu-work/criu.log)"
+            # A bare SIGSEGV carries no criu diagnostic, so the preceding lines
+            # are the only clue to what it was restoring when it died.
+            echo "--- criu work-dir log: last 25 lines before the crash ---"
+            sudo tail -25 /tmp/criu-work/criu.log 2>/dev/null || true
             sudo cp /tmp/criu-work/criu.log ./criu-restore.log 2>/dev/null || true
             echo "--- searching for criu restore logs ---"
             sudo find /run/containerd /var/lib/docker /var/log /tmp -name 'criu*.log' -mmin -5 2>/dev/null | tee found-logs.txt

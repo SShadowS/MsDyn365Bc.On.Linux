@@ -69,7 +69,12 @@ jobs:
       - name: Artifacts
         run: |
           set -e
-          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 755 "$BC_ARTIFACTS_DIR"
+          # No sudo anywhere in this job: setup-snapshot-host.sh creates this
+          # directory once, as part of machine setup.
+          [ -w "$BC_ARTIFACTS_DIR" ] || {
+            echo "::error::$BC_ARTIFACTS_DIR is not writable — run scripts/setup-snapshot-host.sh once"
+            exit 1
+          }
           # Stamped and flock'd: a hit is nearly free, and re-downloading 2 GB
           # would measure Microsoft's CDN rather than anything in this repo.
           bash scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$BC_ARTIFACTS_DIR"
@@ -113,7 +118,7 @@ jobs:
           docker compose ps -a || true
           docker compose logs bc --tail 60 2>&1 | cut -c1-200 || true
           ./scripts/snapshot.sh status || true
-          sudo grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -20 || true
+          grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -20 || true
 
       # Leave the machine idle. A benchmark that parks a BC on the developer's
       # ports until they notice is a bad guest.

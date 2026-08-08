@@ -241,6 +241,21 @@ else
   fi
 fi
 
+# The artifact cache is machine-level state too, and creating it here is what
+# keeps sudo out of the benchmark job.
+ART_DIR="${BC_ARTIFACTS_DIR:-/var/cache/bc-linux/artifacts}"
+if [ -d "$ART_DIR" ] && [ -w "$ART_DIR" ]; then
+  ok "artifact cache $ART_DIR"
+else
+  todo "artifact cache $ART_DIR does not exist"
+  if [ "$CHECK_ONLY" = 0 ] && ask "create $ART_DIR owned by $(id -un)?"; then
+    sudo install -d -o "$(id -u)" -g "$(id -g)" -m 755 "$ART_DIR" \
+      && ok "created $ART_DIR" || { bad "could not create $ART_DIR"; NEED=1; }
+  else
+    NEED=1
+  fi
+fi
+
 # Filesystem matters more than it looks: the two 2.1 GB checkpoint copies are
 # the largest component of a restore, and on btrfs/XFS they become reflinks.
 if [ -d "$STORE_DIR" ]; then

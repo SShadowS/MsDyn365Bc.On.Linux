@@ -347,9 +347,20 @@ jobs:
             cat restore.err
             # "type RESTORE errno 0" names no reason -- it is in this file, the
             # restore-side twin of criu-dump.log.
-            echo "--- criu-restore.log (Error lines) ---"
-            sudo grep -E "Error \(" "$RLOG" 2>/dev/null | tail -15 || sudo tail -30 "$RLOG" 2>/dev/null || echo "(no restore log found)"
-            sudo cp "$RLOG" ./criu-restore.log 2>/dev/null || true
+            # Run 11: the assumed path was empty. After --leave-running=false the
+            # container is exited, so containerd's task dir is gone or transient.
+            # Search instead of assuming -- any criu log touched in the last 5 min.
+            echo "--- searching for criu restore logs ---"
+            sudo find /run/containerd /var/lib/docker /var/log /tmp -name 'criu*.log' -mmin -5 2>/dev/null | tee found-logs.txt
+            while read -r f; do
+              [ -n "$f" ] || continue
+              echo "--- $f (Error lines) ---"
+              sudo grep -E "Error \(" "$f" 2>/dev/null | tail -15 || sudo tail -20 "$f" 2>/dev/null
+              sudo cp "$f" "./$(basename "$f")" 2>/dev/null || true
+            done < found-logs.txt
+            [ -s found-logs.txt ] || echo "(no criu*.log anywhere — checking dockerd journal)"
+            [ -s found-logs.txt ] || sudo journalctl -u docker --since '5 min ago' --no-pager 2>/dev/null \
+              | grep -iE 'criu|restore' | tail -25 | tee criu-restore.log
             {
               echo "### Restore failed"
               echo '```'

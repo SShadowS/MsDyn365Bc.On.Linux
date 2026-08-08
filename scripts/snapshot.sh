@@ -3,15 +3,19 @@
 #
 # OPT-IN PER MACHINE. Inert unless the operator has set this machine up (see
 # "opt-in is a property of the MACHINE" below); no pipeline change enables or
-# disables it. Where it is on, a hit replaces a ~140s cold boot with a ~25-30s
+# disables it. Where it is on, a hit replaces a ~135s cold boot with a ~47s
 # restore, and a miss boots normally and leaves a snapshot behind for next time.
 #
 # WHAT A SNAPSHOT IS
 # ------------------
 # Two files that are only valid TOGETHER:
 #
-#   checkpoint/   the frozen NST process image (~2.1 GB)
-#   cronus.bak    the database it was booted against (~540 MB)
+#   checkpoint/          the frozen NST process image (~2.1 GB)
+#   cronus.bak           the database it was booted against (~540 MB)
+#   bc-snapshot:<key>    a docker image holding the container read-write layer,
+#                        because criu re-opens files by path and some of them
+#                        (the /tmp/bc-stdin FIFO NST holds as stdin) are not in
+#                        any volume
 #
 # Neither restores on its own. The checkpoint holds a process whose memory
 # refers to that database's schema, its published-app metadata and its license;

@@ -1,6 +1,6 @@
 # Snapshot mode — booting BC from a CRIU checkpoint
 
-Replaces a ~140s cold boot with a ~25-30s restore by resuming a checkpointed
+Replaces a ~135s cold boot with a ~47s restore by resuming a checkpointed
 service tier instead of starting one.
 
 **Opt-in per machine, not per pipeline.** An operator sets a machine up once and
@@ -330,20 +330,31 @@ same way the warm service tier and warm artifact cache are.
 
 ## Measurements
 
-GitHub-hosted `ubuntu-22.04`, 4 vCPU, BC 28.1, criu 4.2.1. Two runs of the
-probe, restoring against a **fresh** SQL container with the database reloaded:
+GitHub-hosted `ubuntu-22.04`, 4 vCPU, BC 28.1, criu 4.2.1 — the whole feature
+through `scripts/snapshot.sh`, with the containers **removed** between create
+and restore:
 
-| | run 18 | run 19 |
-|---|---|---|
-| cold boot to healthy | 137s | 140s |
-| checkpoint | 46s | 42s |
-| **restore to OData 200** | **25s** | **29s** |
-| novel app publish afterwards | 200 | 200 |
+| | |
+|---|---|
+| cold boot to healthy | 135s |
+| create (checkpoint 43s + commit + backup + copy + resume) | ~110s, once |
+| **restore, containers gone** | **47s** |
+| OData `/Company` after restore | 200 |
+| novel app compiled after restore and published | 200 |
+| store on disk | 2.7 GB |
 
-The last row is the check that matters: an app compiled *after* the restore
-publishes through the dev endpoint, so the tenant is genuinely functional and
-not merely answering. A boot check alone is not evidence — `StartupHook`'s
-reverted Patch #30 passed one and was catastrophic.
+**~88s saved per run**, and the last two rows are the ones that matter: an app
+that did not exist when the snapshot was taken compiles and publishes into the
+restored tenant, so it is genuinely functional rather than merely answering. A
+boot check alone is not evidence — `StartupHook`'s reverted Patch #30 passed one
+and was catastrophic.
+
+**Why 47s and not the 25-30s the probe reported.** The probe measured only the
+`docker start --checkpoint` → OData window, with SQL already up and the database
+already restored by a previous step. The 47s here is everything a real run pays:
+starting SQL, restoring a 539 MB backup into it, copying the 2.1 GB checkpoint
+into the new container's directory, and then the restore itself. That is the
+honest number for the feature; the 25-30s figure is the process resume alone.
 
 `PERFORMANCE-IDEAS.md` has the full history, including every barrier and its
 fix, and the several theories that turned out to be wrong.

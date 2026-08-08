@@ -162,6 +162,35 @@ fresh SQL container remains the hard, untested case. And a hosted runner is
 ephemeral, so none of this measures the win — that only exists where the
 checkpoint survives between jobs.
 
+### SHIPPED (2026-08-08): snapshot mode. 135s cold boot -> 47s restore.
+
+`scripts/snapshot.sh` + `docker-compose.snapshot.yml`, opt-in per MACHINE (the
+operator creates a store directory; no pipeline changes). Full description in
+**docs/SNAPSHOT.md** — read that first; this section is the road to it.
+
+Verified end to end by `.github/workflows/test-snapshot.yml`, which removes the
+containers between create and restore, so the restore runs against nothing but
+the store and the persisted volumes:
+
+| | |
+|---|---|
+| cold boot to healthy | 135s |
+| create (checkpoint 43s + commit + backup + copy + resume) | ~110s, once |
+| **restore, containers gone** | **47s** |
+| novel app compiled after restore and published | HTTP 200 |
+
+Four things the probe never had to solve, each of which cost a run:
+
+| | |
+|---|---|
+| `docker start --checkpoint-dir` | **unimplemented in the daemon** — "custom checkpointdir is not supported". `create` accepts the flag, so a checkpoint written into the store can never be restored from there. It is taken in docker's own directory and copied in and out. |
+| checkpoint file ownership | the daemon writes it root:700, so sizing, copying and deleting it all need sudo. A `du` that silently undercounted looked exactly like a checkpoint that was never written. |
+| the container read-write layer | criu re-opens files by PATH, and `/tmp/bc-stdin` — the FIFO the entrypoint gives NST as stdin — is not in any volume. A recreated container fails with "Can't open fake fifo". `docker commit` of the stopped container carries it, and does preserve the FIFO. |
+| `set -e` + `$(...)` | `sed` exits 2 on a missing file and that status leaves the script. One run died at exit 2 with no message. `shellcheck` now runs before anything that costs a boot. |
+
+The 25-30s figure below is the process resume ALONE, with SQL already up and the
+database already restored. 47s is what a real run pays.
+
 ### RESULT (run 18): it survives a FRESH SQL container too. 137s boot -> 25s restore.
 
 The case that decides the design, not the easy one. sql is a different container

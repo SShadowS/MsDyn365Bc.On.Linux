@@ -16,8 +16,9 @@
 # the restore is CORRECT, and correctness does not need a second job.
 #
 # This grew out of probe-criu.yml, which answered whether CRIU could do this at
-# all. Nineteen runs of history, every barrier and every wrong theory, are in
-# PERFORMANCE-IDEAS.md — read that before re-litigating a setting here.
+# all. Every barrier and every wrong theory — nineteen probe runs and eight of
+# these — are in PERFORMANCE-IDEAS.md. Read that before re-litigating a setting
+# here; most of them cost a six-minute run to learn.
 name: Test snapshot mode (CRIU)
 
 on:

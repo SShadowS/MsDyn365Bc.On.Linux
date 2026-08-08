@@ -288,6 +288,17 @@ _verify_host_config() {
 # to the docker socket — which is root-equivalent by construction — so the copy
 # can go through THAT authority instead of sudo. The bc image is used because it
 # is certainly present and has GNU cp, so --reflink still applies.
+# Print a root-owned file we have no sudo for. Same authority as the checkpoint
+# copies. Run 10's dump log sat at a containerd path readable only by root, and
+# a bare `[ -r ]` test skipped it without a word — so the failure reported
+# "(no /tmp/criu-work/criu.log)" and stopped there.
+_root_read() {
+  local dir base; dir=$(dirname "$1"); base=$(basename "$1")
+  [ -d "$dir" ] || return 1
+  docker run --rm -v "$dir":/r:ro --entrypoint sh "$(_bc_image_ref)" -c \
+    "cat '/r/$base'" 2>/dev/null
+}
+
 _export_checkpoint() {  # <container-id> <dest-dir>   result is owned by us
   docker run --rm -v "$(_ckpt_path "$1")":/src:ro -v "$2":/dst \
     --entrypoint sh "$(_bc_image_ref)" -c \
@@ -475,11 +486,32 @@ create() {
     log "docker checkpoint create failed:"
     sed -n 1,3p /tmp/snapshot-dump.err >&2
     log "--- criu dump log ---"
-    { grep -hE "Error \(|Warn \(" /tmp/criu-work/criu.log 2>/dev/null \
-        || tail -20 /tmp/criu-work/criu.log 2>/dev/null \
-        || echo "(no /tmp/criu-work/criu.log)"; } | tail -20 >&2
+    # Two candidate locations, and the containerd one needs the docker socket to
+    # read. runc.conf pins work-dir to /tmp/criu-work, but run 10 found nothing
+    # there while the daemon pointed at containerd's copy -- which suggests
+    # runc.conf may not have been honoured at all, and that would ALSO mean
+    # tcp-established was not applied, which is exactly what makes a BC dump
+    # fail. Print whichever exists.
+    local dumped=0
+    if [ -s /tmp/criu-work/criu.log ]; then
+      log "(from /tmp/criu-work/criu.log)"
+      { grep -hE "Error \(|Warn \(" /tmp/criu-work/criu.log || tail -20 /tmp/criu-work/criu.log; } \
+        | tail -20 >&2; dumped=1
+    fi
     local tasklog="/run/containerd/io.containerd.runtime.v2.task/moby/$cid/criu-dump.log"
-    [ -r "$tasklog" ] && { log "--- $tasklog ---"; grep -hE "Error \(" "$tasklog" | tail -10 >&2; }
+    local tl; tl=$(_root_read "$tasklog" || true)
+    if [ -n "$tl" ]; then
+      log "(from $tasklog)"
+      printf '%s\n' "$tl" | grep -E "Error \(|Warn \(" | tail -20 >&2 \
+        || printf '%s\n' "$tl" | tail -20 >&2
+      dumped=1
+      # If criu logged HERE rather than in the configured work-dir, runc did not
+      # apply /etc/criu/runc.conf, and none of its options -- tcp-established
+      # above all -- reached this dump.
+      [ -s /tmp/criu-work/criu.log ] || \
+        log "NOTE: criu did not use the work-dir from /etc/criu/runc.conf, so its options may not have applied either"
+    fi
+    [ "$dumped" = 1 ] || log "(no criu log found in either location)"
     die "checkpoint failed — see the criu log above"
   fi
   [ "$(docker inspect --format '{{.State.Status}}' "$cid")" = "exited" ] \

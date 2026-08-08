@@ -59,6 +59,12 @@ on:
 permissions:
   contents: read
 
+# A newer push supersedes an in-flight probe: each run is a full BC boot, and
+# an older run finishing later would report on superseded code.
+concurrency:
+  group: probe-criu
+  cancel-in-progress: true
+
 jobs:
   probe:
     runs-on: ubuntu-latest
@@ -120,6 +126,9 @@ jobs:
             sudo make -C /tmp/criu install-criu
             command -v criu || sudo ln -sf /usr/local/sbin/criu /usr/sbin/criu
           fi
+          # Hard gate. Run 1 let this pass and everything downstream then measured a
+          # BC that had never been checkpointed.
+          command -v criu >/dev/null || { echo "::error::criu unavailable — probe cannot mean anything"; exit 1; }
           criu --version || sudo criu --version
           echo "--- criu check --all (informational; some features are optional) ---"
           sudo criu check --all
@@ -196,16 +205,28 @@ jobs:
           T1=$(date +%s)
           echo "checkpoint_s=$((T1-T0))" >> "$GITHUB_OUTPUT"
           echo "checkpoint took $((T1-T0))s"
+          # Falsifiable: --leave-running=false must have stopped it. Without this
+          # assertion a no-op "checkpoint" leaves BC running and every later step
+          # passes against a process that was never checkpointed.
+          ST=$(docker inspect --format '{{.State.Status}}' "$CID")
+          echo "container status after checkpoint: $ST"
+          [ "$ST" = "exited" ] || { echo "::error::container still $ST after checkpoint — nothing was checkpointed"; exit 1; }
           sudo du -sh "/var/lib/docker/containers/$CID/checkpoints/cp1" 2>/dev/null \
             || sudo find /var/lib/docker -maxdepth 6 -name cp1 -type d -exec du -sh {} \; 2>/dev/null \
             || echo "(checkpoint dir not located — size unknown)"
 
       - name: Restore from the checkpoint
         id: restore
+        if: ${{ steps.checkpoint.outcome == 'success' }}
         continue-on-error: true
         run: |
           set -e
           CID="${{ steps.boot.outputs.cid }}"
+          # `docker start` on a RUNNING container returns 0 and does nothing —
+          # which is how run 1 reported "restore success, OData 200" in 0s
+          # against a BC that had never stopped. Assert the precondition.
+          ST=$(docker inspect --format '{{.State.Status}}' "$CID")
+          [ "$ST" = "exited" ] || { echo "::error::refusing to 'restore' a container that is $ST"; exit 1; }
           T0=$(date +%s)
           docker start --checkpoint cp1 "$CID"
           # Readiness is OData answering, not the container being "up".
@@ -289,6 +310,17 @@ jobs:
 
           if [ "${{ steps.checkpoint.outputs.classification }}" = "tcp-sockets" ]; then
             echo "::error::Checkpoint refused on established TCP connections. This does NOT rule out CRIU — docker checkpoint cannot pass --tcp-established. Next step is driving criu directly inside the container namespaces."
+            exit 1
+          fi
+          # Any other checkpoint failure is equally fatal to the probe's meaning.
+          # Run 1 classified as "other", fell through every guard, and declared
+          # "Restore verified" about a BC that was never checkpointed.
+          if [ "${{ steps.checkpoint.outcome }}" != "success" ]; then
+            echo "::error::checkpoint did not succeed — nothing downstream means anything"
+            exit 1
+          fi
+          if [ "${{ steps.restore.outcome }}" = "skipped" ] || [ -z "${{ steps.restore.outputs.odata }}" ]; then
+            echo "::error::restore did not run — treating as failure rather than a pass"
             exit 1
           fi
           if [ "${{ steps.restore.outcome }}" != "success" ] || [ "${{ steps.restore.outputs.odata }}" != "200" ]; then

@@ -73,6 +73,9 @@ jobs:
       # boot check alone is not evidence (see Patch #30).
       VERIFY_PUBLISH: ${{ github.event_name != 'workflow_dispatch' && 'true' || inputs.verify_publish }}
       BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache
+      # Only used if criu is not installable from apt (it was not on
+      # ubuntu-24.04 in run 1). Pinned so a source build is reproducible.
+      CRIU_REF: v4.0
 
     steps:
       - uses: actions/checkout@v4
@@ -92,9 +95,32 @@ jobs:
           else
             echo "no $CFG on this runner"
           fi
+          # Run 1 died here: kernel had CONFIG_CHECKPOINT_RESTORE=y but
+          # `apt-get install criu` reported no installation candidate on
+          # ubuntu-24.04. So: diagnose, try enabling universe, and fall back to
+          # building from source. The kernel is the part that cannot be worked
+          # around, and it is already confirmed good.
+          echo "--- apt visibility of criu ---"
+          apt-cache policy criu || true
+          grep -rhoP '^deb .*ubuntu.com/ubuntu/? \K\S+ .*' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null | head -5 || true
+          grep -rl "Components:" /etc/apt/sources.list.d/ 2>/dev/null | head -2 | xargs -r grep -H "Components:" || true
+
+          sudo add-apt-repository -y universe >/dev/null 2>&1 || true
           sudo apt-get update -qq
-          sudo apt-get install -y -qq criu || { echo "::error::criu not installable"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0; }
-          criu --version
+          if sudo apt-get install -y -qq criu; then
+            echo "criu: installed from apt"
+          else
+            echo "::warning::criu not in apt on this runner — building ${CRIU_REF} from source"
+            sudo apt-get install -y -qq build-essential git pkg-config \
+              libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+              python3-protobuf libnl-3-dev libnet-dev libcap-dev libbsd-dev \
+              libgnutls28-dev libnftables-dev iproute2 asciidoc xmlto
+            git clone --depth 1 --branch "$CRIU_REF" https://github.com/checkpoint-restore/criu.git /tmp/criu
+            make -C /tmp/criu -j"$(nproc)" 2>&1 | tail -15
+            sudo make -C /tmp/criu install-criu
+            command -v criu || sudo ln -sf /usr/local/sbin/criu /usr/sbin/criu
+          fi
+          criu --version || sudo criu --version
           echo "--- criu check --all (informational; some features are optional) ---"
           sudo criu check --all
           echo "criu check exit: $?"

@@ -50,17 +50,17 @@ concurrency:
 
 jobs:
   snapshot:
-    # Set the repository variable BENCH_RUNNER to "self-hosted" (or a JSON array
-    # of labels) to run this on your own machine, which is the only place the
-    # wall-clock win exists — a hosted runner throws the store away.
-    # A variable rather than a workflow_dispatch input because dispatch inputs
-    # only register for workflows on the DEFAULT branch, and this file is not
-    # there yet; the push trigger has no such restriction.
+    # Deliberately always hosted. This workflow's job is CORRECTNESS, which an
+    # ephemeral runner proves perfectly well; bench-selfhosted.yml is the one
+    # that goes to a real machine. It used to read the same BENCH_RUNNER
+    # variable, which meant setting that variable sent BOTH workflows to the
+    # same box, where they would fight over ports 7045-7089 and one compose
+    # project.
     #
-    # The hosted default is NOT ubuntu-latest: its 6.17-azure kernel makes criu
-    # fail parsing its own vDSO before it touches any process, so that leg costs
-    # three minutes to learn nothing. 6.8-azure works.
-    runs-on: ${{ vars.BENCH_RUNNER && (startsWith(vars.BENCH_RUNNER, '[') && fromJSON(vars.BENCH_RUNNER) || vars.BENCH_RUNNER) || 'ubuntu-22.04' }}
+    # NOT ubuntu-latest: its 6.17-azure kernel makes criu fail parsing its own
+    # vDSO before it touches any process, so that leg costs three minutes to
+    # learn nothing. 6.8-azure works.
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
       BC_VERSION: ${{ inputs.bc_version || '28.1' }}

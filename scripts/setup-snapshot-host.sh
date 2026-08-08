@@ -31,7 +31,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 CHECK_ONLY=0; ASSUME_YES=0
 STORE_DIR="${BC_SNAPSHOT_DIR:-/var/cache/bc-linux/snapshots}"
 CRIU_MIN=4.2.1
-CRIU_REF="v${CRIU_MIN}"
+# Overridable, so a caller pinning CRIU_REF is not silently ignored.
+CRIU_REF="${CRIU_REF:-v${CRIU_MIN}}"
 
 while [ $# -gt 0 ]; do
   case "$1" in

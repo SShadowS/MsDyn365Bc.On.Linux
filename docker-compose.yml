@@ -126,6 +126,13 @@ services:
     volumes:
       - ${BC_ARTIFACTS_DIR:-bc-artifacts}:/bc/artifacts
       - bc-service:/bc/service
+      # Compiled-assembly (R2R) cache. 1.2 GB on BC 28.1 and rebuilt from
+      # scratch every boot when it lives in the container filesystem. The
+      # entrypoint symlinks BC's per-instance apps/assembly dirs in here and
+      # stamps it with the platform + image, so a version change or an image
+      # rebuild clears it rather than feeding NST assemblies compiled by a
+      # different build.
+      - bc-assembly-cache:/bc/assembly-cache
       # Optional bind mount for an ISV/developer license. Set BC_LICENSE_HOST_PATH
       # to the absolute path of a .bclicense file on the host; the entrypoint will
       # import it (when BC_LICENSE_FILE=/bc/custom-license.bclicense is also set)
@@ -147,3 +154,4 @@ services:
 volumes:
   bc-artifacts:
   bc-service:
+  bc-assembly-cache:

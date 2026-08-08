@@ -936,6 +936,33 @@ PLATFORM_VER=$(python3 -c "import json; print(json.load(open('$ARTIFACTS/app/man
 if [ -n "$PLATFORM_VER" ]; then
     INSTANCE=$(grep -oP 'ServerInstance" value="\K[^"]+' "$SERVICE_DIR/CustomSettings.config" 2>/dev/null || echo "BC")
     SERVER_BASE="/usr/share/Microsoft/Microsoft Dynamics NAV/$NAV_DIR/Server"
+
+    # Persist the compiled-assembly cache across containers when a volume is
+    # mounted at /bc/assembly-cache. It is 1.2 GB on BC 28.1 and lives in the
+    # container filesystem, so every boot rebuilds what the previous one
+    # compiled — the pre-seed below is the cheap approximation of keeping it.
+    #
+    # Symlinked at the `apps/assembly` level, NOT at $SERVER_BASE: that
+    # directory is also BC's temp dir, and persisting scratch state across runs
+    # is how a cache turns into a leak. Stamped like /bc/service, since a
+    # compiled assembly is only valid for the platform that compiled it.
+    if [ -d /bc/assembly-cache ]; then
+        AC_STAMP="/bc/assembly-cache/.bc-assembly-stamp"
+        AC_WANT="v1|platform=$PLATFORM_VER|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)"
+        if [ "$(cat "$AC_STAMP" 2>/dev/null || true)" != "$AC_WANT" ]; then
+            [ -e "$AC_STAMP" ] && log_step "Assembly cache was built by a different platform/image — clearing"
+            find /bc/assembly-cache -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            printf '%s\n' "$AC_WANT" > "$AC_STAMP"
+        fi
+        for _inst in "MicrosoftDynamicsNavServer" "$INSTANCE"; do
+            _link="$SERVER_BASE/MicrosoftDynamicsNavServer\$${_inst}/apps/assembly"
+            [ -L "$_link" ] && continue
+            mkdir -p "$(dirname "$_link")" "/bc/assembly-cache/$_inst"
+            rm -rf "$_link"
+            ln -s "/bc/assembly-cache/$_inst" "$_link"
+        done
+        log_step "Assembly cache persisted via /bc/assembly-cache ($(du -sh /bc/assembly-cache 2>/dev/null | cut -f1) present)"
+    fi
     # Primary = NST's actual path. Secondary = configured-instance path (in case a future
     # BC build starts honoring it). Dedupe if INSTANCE happens to be MicrosoftDynamicsNavServer.
     ASSEMBLY_CACHE_PRIMARY="$SERVER_BASE/MicrosoftDynamicsNavServer\$MicrosoftDynamicsNavServer/apps/assembly/release/${PLATFORM_VER}_1"

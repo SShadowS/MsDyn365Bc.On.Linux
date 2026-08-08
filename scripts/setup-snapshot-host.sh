@@ -65,23 +65,20 @@ fi
 # timestamp for a few minutes after you type a password, so it succeeds without
 # proving any policy. -k drops that cache first, which is what a CI job's fresh
 # session actually faces. The cost is that your next sudo will ask again.
+# Only THIS script needs root, and only to write host configuration. The
+# per-run path (scripts/snapshot.sh) needs none — see the note in the failure
+# branch. So a password prompt here is an inconvenience, not a blocker, and it
+# is no longer counted against readiness.
 SUDO_OK=0
 if sudo -n -k true 2>/dev/null; then
   SUDO_OK=1
   ok "passwordless sudo (verified with a cleared timestamp)"
 else
-  bad "sudo requires a password — a runner job HANGS on the prompt rather than failing"
-  echo "        snapshot.sh needs root for the sysctls, /etc/criu/runc.conf and the"
-  echo "        root-owned checkpoint the docker daemon writes."
-  echo
-  echo "        printf '%s ALL=(ALL) NOPASSWD:ALL\\n' \"$(id -un)\" | sudo tee /etc/sudoers.d/bc-linux"
-  echo "        sudo chmod 0440 /etc/sudoers.d/bc-linux"
-  echo
-  echo "        A narrower rule is not really narrower: the list is sysctl, mkdir,"
-  echo "        tee, chmod, cp, rm, du, grep and criu, i.e. most of coreutils as"
-  echo "        root. And membership of the docker group -- which this user already"
-  echo "        has -- is root-equivalent anyway, so this grants little that is new."
-  NEED=1
+  todo "sudo needs a password — fine for running THIS script interactively,"
+  echo "        but it means this script cannot run unattended in CI."
+  echo "        scripts/snapshot.sh itself needs no sudo at all: the host config"
+  echo "        below is written once, and the root-owned checkpoint is copied"
+  echo "        through the docker socket you already have."
 fi
 
 # ── 3. criu ───────────────────────────────────────────────────────────────────
@@ -182,6 +179,50 @@ else
     else
       NEED=1
     fi
+  else
+    NEED=1
+  fi
+fi
+
+# ── 4b. kernel + criu configuration, PERSISTED ────────────────────────────────
+#
+# These used to be applied by snapshot.sh on every run, which is the single
+# reason the feature looked like it needed root at all: one-time host setup had
+# been smuggled into the per-run path. Written once here; snapshot.sh only
+# checks them and tells you to run this script if they are missing.
+SYSCTL_FILE=/etc/sysctl.d/99-bc-snapshot.conf
+if [ "$(cat /proc/sys/vm/overcommit_memory 2>/dev/null)" = "1" ] \
+   && [ "$(cat /proc/sys/vm/max_map_count 2>/dev/null)" -ge 1048576 ] 2>/dev/null; then
+  ok "vm.overcommit_memory=1, vm.max_map_count>=1048576"
+else
+  # NST's VmSize is ~263 GB of GC reservations. Heuristic overcommit refuses to
+  # recreate that many mappings and the default 65530 map cap is far too low;
+  # both surface during restore as ENOMEM, naming nothing about memory policy.
+  # RSS is only ~2.4 GB — this is a policy change, not a demand for more RAM.
+  todo "kernel needs vm.overcommit_memory=1 and vm.max_map_count>=1048576"
+  if [ "$CHECK_ONLY" = 0 ] && ask "write $SYSCTL_FILE and apply it?"; then
+    printf 'vm.overcommit_memory = 1\nvm.max_map_count = 1048576\n' | sudo tee "$SYSCTL_FILE" >/dev/null \
+      && sudo sysctl -q --load="$SYSCTL_FILE" \
+      && ok "sysctls applied and persisted in $SYSCTL_FILE" \
+      || { bad "could not apply sysctls"; NEED=1; }
+  else
+    NEED=1
+  fi
+fi
+
+# runc reads this when the daemon invokes criu; `docker checkpoint create`
+# exposes no flag for any of it. Each option was unlocked by a specific failed
+# run -- see PERFORMANCE-IDEAS.md.
+if grep -q '^tcp-established' /etc/criu/runc.conf 2>/dev/null; then
+  ok "/etc/criu/runc.conf"
+else
+  todo "/etc/criu/runc.conf missing the options criu needs for BC"
+  if [ "$CHECK_ONLY" = 0 ] && ask "write /etc/criu/runc.conf?"; then
+    sudo mkdir -p /etc/criu \
+      && printf 'tcp-established\ntcp-close\nfile-locks\next-unix-sk\nlink-remap\nghost-limit 512M\nwork-dir /tmp/criu-work\nlog-file criu.log\n' \
+         | sudo tee /etc/criu/runc.conf >/dev/null \
+      && ok "wrote /etc/criu/runc.conf" \
+      || { bad "could not write /etc/criu/runc.conf"; NEED=1; }
   else
     NEED=1
   fi

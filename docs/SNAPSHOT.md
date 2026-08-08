@@ -371,6 +371,26 @@ pair these numbers with an estimated Windows figure.
 `PERFORMANCE-IDEAS.md` has the full history, including every barrier and its
 fix, and the several theories that turned out to be wrong.
 
+## Privilege
+
+**`scripts/snapshot.sh` needs no `sudo`.** Running it does need membership of the
+`docker` group, which is root-equivalent by construction — but nothing beyond
+what building anything with Docker already requires.
+
+That was not true at first, and the reason is worth recording. Three separate
+things had been conflated:
+
+| what | why it looked privileged | where it actually belongs |
+|---|---|---|
+| `vm.overcommit_memory`, `vm.max_map_count`, `/etc/criu/runc.conf` | applied on every run | **one-time machine config** — `setup-snapshot-host.sh` persists them, the run path only checks |
+| `/tmp/criu-work`, the backup staging dir | `sudo` fallbacks added when docker had already created them as root | create them **first**, as yourself; the privilege was fixing damage caused by ordering |
+| the checkpoint under `<docker-root>/containers/…` | genuinely root — the daemon writes it `root:700` | copied **through the docker socket**, using authority the caller already holds |
+
+Only the third is a real requirement, and it does not need `sudo` to satisfy it.
+`setup-snapshot-host.sh` still needs root, once, to write host configuration —
+but that is a human running a setup script, not a CI job holding a blanket
+grant.
+
 ## Benchmarking it on your own machine
 
 The published numbers come from GitHub-hosted runners, which can only show that

@@ -258,18 +258,46 @@ sys.exit(0 if bc.get("network_mode")=="host" else 1)' 2>/dev/null \
   return $ok
 }
 
-_apply_sysctls() {
+# Machine configuration is NOT this script's job. It used to sysctl and write
+# /etc/criu/runc.conf on every run, which is why the whole feature appeared to
+# need root: one-time host setup had been smuggled into the per-run path.
+# scripts/setup-snapshot-host.sh writes both, persistently. Here we only CHECK.
+_verify_host_config() {
+  local bad=0
   # NST's VmSize is ~263 GB of GC reservations. Heuristic overcommit refuses to
   # recreate that many mappings and the default 65530 map cap is far too low;
-  # both show up as ENOMEM during restore, not as anything mentioning memory
-  # pressure. RSS is only ~2.4 GB, so this is a policy change, not a demand for
-  # more RAM.
-  sudo sysctl -qw vm.overcommit_memory=1 vm.max_map_count=1048576
-  sudo mkdir -p /etc/criu
-  # runc reads this; `docker checkpoint create` exposes no flags for any of it.
-  printf 'tcp-established\ntcp-close\nfile-locks\next-unix-sk\nlink-remap\nghost-limit 512M\nwork-dir /tmp/criu-work\nlog-file criu.log\n' \
-    | sudo tee /etc/criu/runc.conf >/dev/null
-  sudo mkdir -p /tmp/criu-work && sudo chmod 777 /tmp/criu-work
+  # both surface as ENOMEM during restore, naming nothing about memory policy.
+  [ "$(cat /proc/sys/vm/overcommit_memory)" = "1" ] \
+    || { log "vm.overcommit_memory is $(cat /proc/sys/vm/overcommit_memory), needs 1"; bad=1; }
+  [ "$(cat /proc/sys/vm/max_map_count)" -ge 1048576 ] \
+    || { log "vm.max_map_count is $(cat /proc/sys/vm/max_map_count), needs >= 1048576"; bad=1; }
+  # runc reads this; `docker checkpoint create` exposes no flag for any of it.
+  grep -q '^tcp-established' /etc/criu/runc.conf 2>/dev/null \
+    || { log "/etc/criu/runc.conf missing or lacks tcp-established"; bad=1; }
+  [ "$bad" = 0 ] || { log "run scripts/setup-snapshot-host.sh once on this machine"; return 1; }
+  # Ours to create, in /tmp, as ourselves. criu runs as root and writes its log
+  # here with a default umask, so the log stays readable without privilege.
+  mkdir -p /tmp/criu-work 2>/dev/null && chmod 777 /tmp/criu-work 2>/dev/null || true
+  return 0
+}
+
+# ── files the docker DAEMON owns ─────────────────────────────────────────────
+#
+# The checkpoint lands under <docker-root>/containers/<id>/checkpoints as
+# root:700, and no amount of tidying changes that. But this user already talks
+# to the docker socket — which is root-equivalent by construction — so the copy
+# can go through THAT authority instead of sudo. The bc image is used because it
+# is certainly present and has GNU cp, so --reflink still applies.
+_export_checkpoint() {  # <container-id> <dest-dir>   result is owned by us
+  docker run --rm -v "$(_ckpt_path "$1")":/src:ro -v "$2":/dst \
+    --entrypoint sh "$(_bc_image_ref)" -c \
+    "cp -a --reflink=auto /src/cp1 /dst/cp1 && chown -R $(id -u):$(id -g) /dst/cp1"
+}
+
+_import_checkpoint() {  # <store-checkpoint-dir> <container-id>
+  docker run --rm -v "$1":/src:ro -v "$(dirname "$(_ckpt_path "$2")")":/dst \
+    --entrypoint sh "$(_bc_image_ref)" -c \
+    "mkdir -p /dst/checkpoints && rm -rf /dst/checkpoints/cp1 && cp -a --reflink=auto /src/cp1 /dst/checkpoints/cp1"
 }
 
 # -b is load-bearing: WITHOUT it sqlcmd exits 0 even when the T-SQL fails. The
@@ -299,12 +327,15 @@ _create_failed() {
 
 _prepare_sqldir() {
   local d="${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}"
-  mkdir -p "$d" 2>/dev/null || sudo mkdir -p "$d"
-  chmod 777 "$d" 2>/dev/null || sudo chmod 777 "$d"
+  # Created by US, before docker ever mounts it. The sudo fallbacks that used to
+  # be here existed only because docker had already auto-created the bind-mount
+  # source as root — a problem caused by creating it too late, not one needing
+  # privilege.
+  mkdir -p "$d" && chmod 777 "$d" || die "cannot prepare $d"
   # SQL Server wrote the previous backup as uid 10001 mode 640. cp TRUNCATES an
   # existing file, which needs write permission on the FILE — a 777 directory
   # does not help. Remove it first; unlink only needs the directory.
-  rm -f "$d/cronus.bak" 2>/dev/null || sudo rm -f "$d/cronus.bak"
+  rm -f "$d/cronus.bak" 2>/dev/null || true
 }
 
 # The checkpoint is written by the docker daemon, so it is root-owned and mode
@@ -323,9 +354,9 @@ _rm_store() {
   local img=""
   [ -f "$1/$STAMP_NAME" ] && img=$(sed -n 's|^rootfs_image=||p' "$1/$STAMP_NAME" | head -1)
   [ -n "$img" ] && docker image rm -f "$img" >/dev/null 2>&1 || true
-  rm -rf "${1:?}" 2>/dev/null || sudo rm -rf "${1:?}"
+  rm -rf "${1:?}" 2>/dev/null || log "could not remove $1 — if it predates the sudo-free rewrite it may be root-owned; remove it by hand"
 }
-_du_store() { sudo du -sh "$1" 2>/dev/null | cut -f1 || echo "?"; }
+_du_store() { du -sh "$1" 2>/dev/null | cut -f1 || echo "?"; }
 
 _bc_odata() {
   docker compose exec -T bc curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
@@ -378,7 +409,7 @@ status() {
 create() {
   _resolve_store_root >/dev/null || die "this machine is not set up for snapshots — see docs/SNAPSHOT.md"
   preflight || die "host cannot checkpoint (see above)"
-  _apply_sysctls
+  _verify_host_config || die "host configuration incomplete"
   local s cid t0
   s=$(_store) || die "cannot compute a snapshot key (run: scripts/snapshot.sh key)"
   cid=$(docker compose ps -q bc || true)
@@ -404,7 +435,7 @@ create() {
   # space) and an ordinary copy everywhere else. The two 2.1 GB copies are the
   # largest single component of restore time on a fast disk, so this is worth
   # the one word even though it is a no-op on ext4.
-  sudo cp -a --reflink=auto "$(_ckpt_path "$cid")/cp1" "$s/checkpoint/cp1"
+  _export_checkpoint "$cid" "$s/checkpoint"
   [ -d "$s/checkpoint/cp1" ] || die "checkpoint did not copy into the store"
 
   # The checkpoint is only half of what the process needs: criu references open
@@ -455,7 +486,7 @@ create() {
     # so whatever breaks here breaks the feature, not just this convenience.
     log "could not resume from the fresh checkpoint — cold booting so the caller is not left without a BC"
     sed -n 1,5p /tmp/snapshot-resume.err >&2 || true
-    sudo grep -E "Error \\(|killed by signal" /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
+    grep -E "Error \\(|killed by signal" /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
     docker compose up -d --wait
   fi
   trap - EXIT
@@ -494,7 +525,7 @@ restore() {
     return 1
   fi
 
-  _apply_sysctls
+  _verify_host_config || return 1
   local t0; t0=$(date +%s)
 
   # SQL first: the restored NST wakes holding a connection pool whose peer is
@@ -551,13 +582,10 @@ restore() {
   local cid; cid=$(docker compose ps -aq bc)
   [ -n "$cid" ] || { log "could not create the bc container — cold boot"; return 1; }
   # The new container has a new id, so its checkpoint directory is a new path.
-  local dst; dst=$(_ckpt_path "$cid")
-  sudo mkdir -p "$dst"
-  sudo rm -rf "${dst:?}/cp1"
-  sudo cp -a --reflink=auto "$s/checkpoint/cp1" "$dst/cp1"
+  _import_checkpoint "$s/checkpoint" "$cid"
   if ! docker start --checkpoint cp1 "$cid" 2>/tmp/snapshot-restore.err; then
     log "restore failed — cold boot:"; sed -n 1,5p /tmp/snapshot-restore.err >&2
-    sudo grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
+    grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
     _discard "$s" "restore failed"
     return 1
   fi

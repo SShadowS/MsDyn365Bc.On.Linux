@@ -28,12 +28,60 @@
 #   - Timing is logged for each phase so you can see exactly where time
 #     goes: version resolution, download, and extraction.
 #
+# Caching:
+#   A successful run leaves a `.bc-artifact-cache` stamp in <dest> recording
+#   the exact app + platform URLs it downloaded. A later run whose resolved
+#   URLs match that stamp — and whose extraction still looks intact — returns
+#   in milliseconds instead of re-fetching ~2 GB.
+#
+#   The stamp is keyed on the RESOLVED FULL version, not the requested one,
+#   so a short version ("28.3") that Microsoft has since hotfixed resolves to
+#   a new URL, misses the cache, and re-downloads. That property is the whole
+#   reason the resolve step still runs on a cache hit: bc-linux deliberately
+#   tracks the newest build of a short version (see CLAUDE.md, "The version
+#   matrix is discovered at run time").
+#
+#   This is NOT actions/cache — nothing is uploaded or downloaded from
+#   GitHub, and CLAUDE.md's ban on caching artifacts THROUGH GitHub's cache
+#   still stands, for the reasons recorded there. This is opportunistic reuse
+#   of whatever the filesystem already holds: a no-op on an ephemeral hosted
+#   runner (empty dir every job, one extra index fetch of ~200 ms), and the
+#   difference between a ~30-60s fetch phase and ~0 on a self-hosted runner
+#   or a local dev box.
+#
+#   BC_ARTIFACT_REFRESH=1 forces a miss. When the index is unreachable and a
+#   stamp exists for the same REQUEST (type/version/country, or URL), the
+#   cache is used with a warning rather than failing the run — an offline box
+#   with warm artifacts now boots instead of erroring out.
+#
 # Usage:
 #   With full URL:  download-artifacts.sh <url> <dest>
 #   With parts:     download-artifacts.sh <type> <version> <country> <dest>
 set -e
 
 _ms() { date +%s%3N; }
+
+# ── Serialize concurrent runs against the same dest ────────────────────────
+# Two invocations sharing one cache dir (several self-hosted runners on one
+# host, or a matrix pointed at a shared BC_ARTIFACTS_DIR) would otherwise
+# race: both miss, both clear, both extract into the same tree. The lock makes
+# the second one wait and then hit the cache the first one just wrote.
+#
+# Taken before argument parsing so the version resolve happens once, inside
+# the lock, rather than once per waiter. flock is util-linux — present on
+# GitHub runners and in the bc-runner image — but a box without it runs
+# unlocked (previous behavior) instead of failing.
+if [ -z "${BC_ARTIFACT_LOCKED:-}" ] && command -v flock >/dev/null 2>&1; then
+    case $# in
+        2) _LOCK_DEST="$2" ;;
+        4) _LOCK_DEST="$4" ;;
+        *) _LOCK_DEST="" ;;
+    esac
+    if [ -n "$_LOCK_DEST" ] && mkdir -p "$_LOCK_DEST" 2>/dev/null; then
+        export BC_ARTIFACT_LOCKED=1
+        exec flock "$_LOCK_DEST/.bc-artifact-lock" "$0" "$@"
+    fi
+fi
 
 # Parallel range streams per file (two files download concurrently, so the
 # total connection count is 2x this). 16 gives ~16x cold-miss throughput;
@@ -191,14 +239,47 @@ with ThreadPoolExecutor(workers) as ex:
 PYEOF
 }
 
+# ── Cache stamp helpers ────────────────────────────────────────────────────
+# The stamp records two keys:
+#   key=     the resolved app+platform URLs. A match means "the bytes on disk
+#            are exactly what this invocation would download."
+#   request= the arguments as GIVEN. Only consulted when version resolution
+#            fails (no network / index down), as a last-resort "this dir was
+#            built from the same request, use it rather than dying."
+STAMP_NAME=".bc-artifact-cache"
+
+# An extraction is only usable if BOTH halves landed. These are the same two
+# paths the entrypoint waits for when BC_ARTIFACT_URL=skip, so agreeing with
+# it here means a cache hit can never satisfy this script but starve the
+# container.
+_cache_intact() {
+    [ -f "$1/app/manifest.json" ] && [ -d "$1/platform/ServiceTier" ]
+}
+
+_stamp_field() {
+    # _stamp_field <dest> <field>
+    [ -f "$1/$STAMP_NAME" ] || return 1
+    sed -n "s|^$2=||p" "$1/$STAMP_NAME" | head -1
+}
+
+# Everything this script created, and nothing else. Deliberately NOT
+# `rm -rf "$DEST"` — DEST is a bind mount / named volume mount point in every
+# caller, and removing it would break the mount rather than clear it.
+_cache_clear() {
+    # ${1:?} so an empty dest can never turn this into `rm -rf /app /platform`.
+    rm -rf "${1:?}/app" "${1:?}/platform" "${1:?}/$STAMP_NAME"
+}
+
 # Parse arguments: either (url, dest) or (type, version, country, dest)
 if [ $# -eq 2 ]; then
     APP_URL="$1"
     DEST="$2"
     # Derive platform URL: replace country segment with "platform"
     PLATFORM_URL=$(echo "$APP_URL" | sed 's|/[^/]*$|/platform|')
+    REQUEST_KEY="url|$APP_URL"
 elif [ $# -eq 4 ]; then
     BC_TYPE="$1"; BC_VERSION="$2"; BC_COUNTRY="${3,,}"; DEST="$4"
+    REQUEST_KEY="args|$1|$2|${3,,}"
     BASE_URL="https://bcartifacts-exdbf9fwegejdqak.b02.azurefd.net"
 
     # Resolve short version (e.g. "27.5") to full version (e.g. "27.5.46862.48612)
@@ -263,6 +344,17 @@ print(versions[-1])
           sleep 3
         done
         if [ -z "$RESOLVED" ]; then
+            # Before failing: if this dest already holds a complete extraction
+            # built from the SAME request, the index being unreachable is not a
+            # reason to take the box down. We can't tell whether a hotfix has
+            # shipped since, so say so loudly and carry on with what we have.
+            if [ "${BC_ARTIFACT_REFRESH:-}" != "1" ] && _cache_intact "$DEST" \
+               && [ "$(_stamp_field "$DEST" request || true)" = "$REQUEST_KEY" ]; then
+                echo "[artifacts] WARN: version index unreachable — falling back to the cached"
+                echo "[artifacts] WARN: artifacts already in $DEST ($(_stamp_field "$DEST" key || echo unknown))."
+                echo "[artifacts] WARN: These may be behind a newer $REQUESTED_PREFIX.x hotfix."
+                exit 0
+            fi
             echo "[artifacts] ERROR: Could not resolve version $REQUESTED_PREFIX from $INDEX_URL"
             echo "[artifacts] Workaround: pin BC_VERSION to a fully-qualified version, e.g.:"
             echo "[artifacts]   BC_VERSION=27.5.46862.48612 docker compose up -d --wait"
@@ -284,6 +376,25 @@ fi
 
 echo "[artifacts] App URL:      $APP_URL"
 echo "[artifacts] Platform URL: $PLATFORM_URL"
+
+CACHE_KEY="v1|$APP_URL|$PLATFORM_URL"
+
+# ── Cache check ────────────────────────────────────────────────────────────
+if [ "${BC_ARTIFACT_REFRESH:-}" = "1" ]; then
+    echo "[artifacts] BC_ARTIFACT_REFRESH=1 — ignoring any cached artifacts"
+    _cache_clear "$DEST"
+elif [ "$(_stamp_field "$DEST" key || true)" = "$CACHE_KEY" ] && _cache_intact "$DEST"; then
+    echo "[artifacts] CACHE HIT — $DEST already holds these exact artifacts ($(du -sh "$DEST" 2>/dev/null | cut -f1)). Skipping download."
+    exit 0
+elif [ -e "$DEST/app" ] || [ -e "$DEST/platform" ]; then
+    # Stale (different version), or a torn extraction from an interrupted run.
+    # Either way the safe move is to start clean: a half-extracted service tier
+    # fails much later and much more confusingly than a re-download.
+    echo "[artifacts] Cache miss — clearing stale/incomplete artifacts in $DEST"
+    echo "[artifacts]   cached:  $(_stamp_field "$DEST" key || echo '(no stamp)')"
+    echo "[artifacts]   wanted:  $CACHE_KEY"
+    _cache_clear "$DEST"
+fi
 
 # Download zips to a temp dir (host /tmp is fast tmpfs/SSD, not a Docker volume).
 # This avoids writing ~1-3 GB of zip data into the destination volume just to
@@ -384,6 +495,18 @@ for pid in $EXTRACT_PIDS; do
 done
 PLATFORM_VERSION=$(python3 -c "import json; print(json.load(open('$DEST/app/manifest.json'))['platform'])" 2>/dev/null)
 echo "[artifacts] Platform version: $PLATFORM_VERSION"
+
+# Stamp LAST, and only once both extractions have been waited on — the stamp
+# is what a later run trusts to skip all of the above, so it must never
+# describe a tree that is still being written.
+if ! _cache_intact "$DEST"; then
+    echo "[artifacts] ERROR: extraction finished but $DEST is missing app/manifest.json or platform/ServiceTier"
+    exit 1
+fi
+{
+    echo "key=$CACHE_KEY"
+    echo "request=$REQUEST_KEY"
+} > "$DEST/$STAMP_NAME"
 
 T_DONE=$(_ms)
 EXTRACT_MS=$(( T_DONE - T_EXTRACT ))

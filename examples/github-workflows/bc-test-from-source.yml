@@ -222,6 +222,16 @@ jobs:
         working-directory: bc-linux
         run: |
           bash scripts/workflow-summary.sh begin BC_BOOT "BC startup (background → wait for healthy)"
+          # Clear any leftover compose state before starting. On a GitHub-hosted
+          # runner this is a no-op (fresh VM, nothing to remove). On a self-hosted
+          # one the previous job's bc/sql containers may still be running, and
+          # `docker compose up -d` adopts a running container instead of recreating
+          # it — the healthcheck then goes green in seconds against the PREVIOUS
+          # run's database and published apps, which looks like a very fast pass.
+          # Named volumes are kept on purpose: the entrypoint stamps /bc/service
+          # and reuses it only when it matches this platform + image, so the warm
+          # path stays warm without going stale.
+          docker compose down --remove-orphans 2>/dev/null || true
           docker compose up -d
           echo "BC container started in background — continuing with other work."
 

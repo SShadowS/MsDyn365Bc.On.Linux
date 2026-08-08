@@ -45,26 +45,96 @@ SERVICE_DIR="/bc/service"
 # Step 1: Download artifacts if not already present
 # =============================================================================
 STEP1_START=$(date +%s)
-if [ ! -f "$ARTIFACTS/app/manifest.json" ]; then
-    if [ "$BC_ARTIFACT_URL" = "skip" ]; then
+
+# Is what's on disk the artifact set THIS container was asked for?
+#
+# `/bc/artifacts` outlives the container in both deployments that matter: the
+# `bc-artifacts` named volume locally, and a workspace bind mount that a
+# self-hosted runner reuses between jobs. Until this check existed the guard
+# was "does app/manifest.json exist" — so changing BC_VERSION without
+# `down -v` silently booted the PREVIOUS version's artifacts, and the only
+# symptom was BC reporting a version nobody asked for.
+#
+# Deliberately network-free. download-artifacts.sh re-resolves a short version
+# against Microsoft's index to pick up hotfixes, which is right on the host but
+# wrong here: in CI the host already resolved and downloaded, so a hotfix
+# published in the seconds since would make the container wipe the host's
+# artifacts and re-fetch ~2 GB in the middle of BC boot. The container's job is
+# to use what it was given, and only fetch when it was given nothing usable.
+ARTIFACT_STAMP="$ARTIFACTS/.bc-artifact-cache"
+if [ -n "$BC_ARTIFACT_URL" ] && [ "$BC_ARTIFACT_URL" != "skip" ]; then
+    WANT_ARTIFACTS="url|$BC_ARTIFACT_URL"
+else
+    WANT_ARTIFACTS="args|$BC_TYPE|$BC_VERSION|${BC_COUNTRY,,}"
+fi
+
+artifacts_intact() {
+    [ -f "$ARTIFACTS/app/manifest.json" ] && [ -d "$ARTIFACTS/platform/ServiceTier" ]
+}
+
+# "hit" | "stale" | "miss"
+artifact_cache_state() {
+    artifacts_intact || { echo miss; return; }
+    local have
+    have=$(sed -n 's|^request=||p' "$ARTIFACT_STAMP" 2>/dev/null | head -1)
+    if [ -n "$have" ]; then
+        [ "$have" = "$WANT_ARTIFACTS" ] && echo hit || echo "stale:downloaded for $have"
+        return
+    fi
+    # No stamp: either artifacts staged by hand (BC_ARTIFACT_URL=skip, the
+    # macOS overlay) or a volume that predates the stamp. Fall back to the
+    # manifest, which carries the version/country for the app half. Only
+    # contradiction counts as stale — a manifest without those fields is not
+    # evidence of anything, so trust the dir as this script always used to.
+    local mismatch
+    mismatch=$(BC_WANT_VERSION="$BC_VERSION" BC_WANT_COUNTRY="${BC_COUNTRY,,}" \
+        python3 - "$ARTIFACTS/app/manifest.json" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+try:
+    m = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+ver, country = str(m.get('version', '')), str(m.get('country', '')).lower()
+want_ver, want_country = os.environ['BC_WANT_VERSION'], os.environ['BC_WANT_COUNTRY']
+# Requested version is a prefix of the full one ("28.3" vs "28.3.12345.67").
+if ver and want_ver and not (ver == want_ver or ver.startswith(want_ver + '.')):
+    print(f"version {ver} != requested {want_ver}")
+elif country and want_country and country != want_country:
+    print(f"country {country} != requested {want_country}")
+PYEOF
+)
+    [ -n "$mismatch" ] && echo "stale:$mismatch" || echo hit
+}
+
+if [ "$BC_ARTIFACT_URL" = "skip" ]; then
+    if ! artifacts_intact; then
         log_step "Waiting for artifacts to be provided externally..."
         # Wait for BOTH app manifest AND platform ServiceTier to be present
         for i in $(seq 1 120); do
-            [ -f "$ARTIFACTS/app/manifest.json" ] && \
-            [ -d "$ARTIFACTS/platform/ServiceTier" ] && break
+            artifacts_intact && break
             sleep 2
         done
         [ -f "$ARTIFACTS/app/manifest.json" ] || { log_step "ERROR: App artifacts not provided"; exit 1; }
         [ -d "$ARTIFACTS/platform/ServiceTier" ] || { log_step "ERROR: Platform artifacts not provided"; ls -la "$ARTIFACTS/platform/" 2>/dev/null; exit 1; }
-    elif [ -n "$BC_ARTIFACT_URL" ]; then
-        log_step "Downloading BC from $BC_ARTIFACT_URL..."
-        /bc/scripts/download-artifacts.sh "$BC_ARTIFACT_URL" "$ARTIFACTS"
-    else
-        log_step "Downloading BC $BC_TYPE $BC_VERSION ($BC_COUNTRY)..."
-        /bc/scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$ARTIFACTS"
     fi
 else
-    log_step "Artifacts already cached."
+    ARTIFACT_STATE=$(artifact_cache_state)
+    case "$ARTIFACT_STATE" in
+        hit)
+            log_step "Artifacts already cached ($WANT_ARTIFACTS) — skipping download."
+            ;;
+        *)
+            [ "$ARTIFACT_STATE" != "miss" ] && \
+                log_step "Cached artifacts do not match this container (${ARTIFACT_STATE#stale:}) — refetching"
+            if [ -n "$BC_ARTIFACT_URL" ]; then
+                log_step "Downloading BC from $BC_ARTIFACT_URL..."
+                /bc/scripts/download-artifacts.sh "$BC_ARTIFACT_URL" "$ARTIFACTS"
+            else
+                log_step "Downloading BC $BC_TYPE $BC_VERSION ($BC_COUNTRY)..."
+                /bc/scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$ARTIFACTS"
+            fi
+            ;;
+    esac
 fi
 log_step "Step 1 (artifacts): $(($(date +%s) - STEP1_START))s"
 
@@ -85,6 +155,36 @@ log_step "Platform: $PLATFORM_VERSION, NAV dir: $NAV_DIR, DB: $DB_FILE"
 # Step 2: Copy service tier to working directory (if not already set up)
 # =============================================================================
 STEP2_START=$(date +%s)
+
+# `/bc/service` is a volume, so a patched service tier survives the container.
+# Reusing it is the point — Step 2 + 2b are ~6s — but only when it was built
+# from THIS platform version by THIS image. The guard used to be "does
+# Nav.Server.dll exist", which is true for any previous version's leftovers,
+# so switching BC_VERSION or rebuilding the image with a changed StartupHook
+# silently kept the old, differently-patched tier. That's why CLAUDE.md tells
+# you to run `docker compose down -v` after editing the hook; with the stamp
+# the rebuild is automatic and that step is no longer a footgun.
+#
+# The image half of the key is StartupHook.dll's size+mtime: docker gives every
+# file in a rebuilt layer a fresh mtime, so it changes exactly when the image
+# does, and reading it costs one stat.
+SERVICE_STAMP_FILE="$SERVICE_DIR/.bc-service-stamp"
+SERVICE_STAMP="v1|platform=$PLATFORM_VERSION|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)"
+if [ -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ] && \
+   [ "$(cat "$SERVICE_STAMP_FILE" 2>/dev/null || true)" != "$SERVICE_STAMP" ]; then
+    log_step "Service tier in the volume was built by a different platform/image — rebuilding it"
+    log_step "  found:  $(cat "$SERVICE_STAMP_FILE" 2>/dev/null || echo '(no stamp)')"
+    log_step "  want:   $SERVICE_STAMP"
+    # Clear the CONTENTS, not the directory: $SERVICE_DIR is a volume mount
+    # point and removing it would break the mount.
+    find "$SERVICE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# Set BEFORE Step 2 runs, so it means "the volume was already fully prepared",
+# not "we just prepared it".
+SERVICE_STAMP_MATCH=0
+[ "$(cat "$SERVICE_STAMP_FILE" 2>/dev/null || true)" = "$SERVICE_STAMP" ] && SERVICE_STAMP_MATCH=1
+
 if [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ]; then
     log_step "Setting up service tier..."
     # Auto-detect service tier path (differs between versions: PFiles64 vs "program files")
@@ -272,6 +372,15 @@ if [ ! -f "/bc/patched/netstandard-merged.dll" ] && [ -f /bc/tools/MergeNetstand
     log_step "Merged assemblies generated in $(($(date +%s) - STEP2B_START))s"
 fi
 
+# The rest of Step 2b writes patched assemblies INTO the service dir, so a
+# stamp hit means every one of them is already there — including the three
+# PatchNclTestPage passes, which are three `dotnet` process starts against
+# DLLs that are already patched. Skipping is what makes a warm volume cheap;
+# the wipe above is what makes it safe.
+if [ "$SERVICE_STAMP_MATCH" = "1" ]; then
+    log_step "Service tier already patched by this image ($SERVICE_STAMP) — skipping binary patch pass"
+else
+
 # Apply patched DLLs (Cecil-modified to fix Linux-specific bugs)
 # Patch #14: CodeAnalysis.dll — fix IsTypeForwardingCircular NullRef on Linux
 #   BC's Cecil type loader crashes following type-forwarding chains in netstandard.dll.
@@ -383,6 +492,14 @@ PYEOF
         fi
     fi
 fi
+
+# Stamp only after every patch above has been applied. A crash partway through
+# leaves the dir unstamped, so the next boot rebuilds it instead of trusting a
+# half-patched tier.
+printf '%s\n' "$SERVICE_STAMP" > "$SERVICE_STAMP_FILE"
+
+fi  # SERVICE_STAMP_MATCH
+log_step "Step 2b (patched assemblies): $(($(date +%s) - STEP2B_START))s"
 
 
 # =============================================================================

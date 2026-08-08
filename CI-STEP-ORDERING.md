@@ -104,6 +104,35 @@ Tried 2026-04-08, documented at the call site in `scripts/entrypoint.sh`.
 The NST serializes publishes server-side; layered concurrency=4 took the
 same ~27s as serial POSTs.
 
+## Self-hosted runners
+
+The numbers above are all GitHub-hosted, i.e. a fresh VM per job where
+nothing survives. On a self-hosted runner the disk persists, and as of
+2026-08-08 the pipeline exploits that without any configuration: the fetch
+phase (29s at 4-vCPU, 58s at 2-vCPU — the largest single block in the smoke
+leg) drops to roughly zero whenever the resolved build is already extracted,
+and Step 2/2b's ~6s of service-tier patching is skipped when the volume's
+stamp matches. See CLAUDE.md, "Reusing a warm filesystem is NOT the
+artifact-cache ban", for the stamps and what invalidates each.
+
+What that leaves is BC's own boot, which is unchanged — so a warm
+self-hosted leg is bounded below by roughly `compose up` + NST startup +
+publish + tests. Do not expect the fetch-phase saving to compound with
+anything; it comes off the front of the job and the pole is still BC.
+
+Two things a self-hosted operator has to handle that a hosted runner gets
+for free:
+
+- **Leftover containers.** The workflows now run `docker compose down
+  --remove-orphans` before `up -d`. Without it, `up -d` adopts the previous
+  job's still-running containers and the healthcheck goes green in seconds
+  against the *previous* run's database — a pass that proves nothing.
+- **Concurrency.** Two jobs on one host collide on the published 7045-7089
+  ports. Give each runner its own compose project name and port offset (see
+  README, "Running Multiple Instances"). A shared `artifact_cache_dir` is
+  safe under concurrency — `download-artifacts.sh` locks it — but the ports
+  are not.
+
 ## What would actually move the needle
 
 The two big blocks are BC's own work: NST startup (31s) and the post-NST

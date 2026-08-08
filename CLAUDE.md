@@ -88,7 +88,7 @@ docker compose build bc && docker compose up -d --wait
 ### Key invariants worth remembering
 
 - **.NET runtime tuning.** The entrypoint sets `DOTNET_gcServer=1` (Server GC, better throughput for the parallel Roslyn compile during NST startup — contrary to older PERFORMANCE-IDEAS.md warnings, this works fine in current BC 27.x) and `DOTNET_TieredCompilation=0` (tier-0 disabled so JMP hooks don't get overwritten by Tier 1 recompilation — the Watson crash handler and several other patches rely on hooks staying in place). Additional tuning knobs (`DOTNET_ReadyToRun`, `DOTNET_GCRetainVM`, `DOTNET_GCConserveMemory`, `DOTNET_GCHeapCount`, `DOTNET_GCNoAffinitize`) are exposed via docker-compose passthroughs for A/B experiments without rebuilding the image — see the `.NET runtime tuning` block in `docker-compose.yml`. Tested 2026-04-08: `DOTNET_ReadyToRun=1` and `DOTNET_GCRetainVM=1` both individually made cold boot ~5s slower on local, not faster. Not adopted.
-- **`/bc/service` is a volume**: edits to BC DLLs persist across container restarts, and the entrypoint guards `Step 2` / `Step 2b` with `[ -f ... ]` checks. To force re-patching, `docker compose down -v` (or delete the `bc-service` volume).
+- **`/bc/service` is a volume**: edits to BC DLLs persist across container restarts, and the entrypoint skips `Step 2` / `Step 2b` when the volume's `.bc-service-stamp` matches this platform version + image. A BC version change or an image rebuild flips the stamp, and the entrypoint wipes and re-patches on its own — so `docker compose build bc && docker compose up -d` is enough to pick up a `StartupHook.cs` change. `docker compose down -v` still works and is the way to force it if you've hand-edited something inside the volume.
 - **`Add-ins` vs `Add-Ins`**: Linux is case-sensitive. The entrypoint renames the directory; never refer to the lowercase form in new patches.
 - **Patches that depend on assembly load order** (e.g. #18 `SetupSideServices` must run before `Main()` calls it) live in `StartupHook.Initialize()`, not in the per-assembly load callback. Adding a new patch in the wrong place will silently fail because the type isn't loaded yet — or, worse, succeed once and then break on the next BC update because load order shifted.
 
@@ -281,6 +281,46 @@ Before proposing a reordering or parallelization change to the workflows,
 read `CI-STEP-ORDERING.md` — it has the step-level critical path for both
 workload shapes, the measured noise floor, and the reorderings already
 tried and reverted.
+
+### Reusing a warm filesystem is NOT the artifact-cache ban (added 2026-08-08)
+
+The rule above is about pushing artifacts *through GitHub's cache service*:
+upload cost every run, 10 GB repo cap, a key Microsoft invalidates several
+times a day. All of that still holds. None of it applies to a directory
+that is simply **already on the disk** — which is the normal state of
+affairs on a self-hosted runner and on every dev box.
+
+So there are now three stamped caches, each keyed on what would actually
+invalidate it, each a no-op on a GitHub-hosted runner (fresh VM, nothing
+on disk, so every check misses and the code path is the one that always ran):
+
+| what | stamp | key | invalidated by |
+|---|---|---|---|
+| extracted artifacts | `<dest>/.bc-artifact-cache` | resolved app + platform **URL** | a new hotfix under the same short version, a version/country change |
+| same, container side | reads the stamp above | the *request* (type/version/country or URL) | someone changing `BC_VERSION` on a persistent volume |
+| patched service tier | `/bc/service/.bc-service-stamp` | platform version + `StartupHook.dll` size+mtime | a BC version change, or any image rebuild |
+
+Three things about this are deliberate and easy to get wrong:
+
+- **The host resolves the version even on a hit; the container never does.**
+  Resolving is what lets a hotfix invalidate the cache, which is the whole
+  point of tracking short versions. But in CI the host has *already*
+  resolved and downloaded, so if the container re-resolved and Microsoft
+  published a build in the intervening seconds, it would wipe the host's
+  artifacts and re-fetch ~2 GB in the middle of BC boot. The container's
+  job is to use what it was handed.
+- **A miss clears the directory before downloading.** A torn extraction
+  from an interrupted run fails much later and much more confusingly than
+  a re-download does.
+- **`/bc/service` is stamped with the image, not just the platform.** That
+  is what makes rebuilding the image with a changed `StartupHook.cs` take
+  effect without `docker compose down -v` — the old "does Nav.Server.dll
+  exist" guard happily kept a tier patched by a different build, which is
+  why the `down -v` instruction existed in the first place.
+
+`BC_ARTIFACT_REFRESH=1` forces a re-download. `download-artifacts.sh`
+`flock`s its destination, so several runners can share one
+`artifact_cache_dir` without racing.
 
 ### The TestRunnerExtension app.json seed is load-bearing
 

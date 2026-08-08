@@ -27,6 +27,23 @@ on:
         required: false
         type: string
         default: "27.5"
+      artifact_cache_dir:
+        description: >
+          Directory to hold the extracted BC artifacts. Defaults to
+          <workspace>/artifact-cache, which is correct for a GitHub-hosted
+          runner (fresh VM every job, so the dir is always empty and the
+          download happens exactly as before).
+
+          On a SELF-HOSTED runner the download is skipped entirely whenever the
+          dir already holds the same resolved build — point this at a path
+          OUTSIDE the workspace (e.g. /var/cache/bc-artifacts) to share one
+          cache across every job and runner on the host. Concurrent jobs are
+          safe: download-artifacts.sh locks the directory, so the second job
+          waits and then hits the cache the first one wrote. Budget ~3.1 GB
+          per BC version kept.
+        required: false
+        type: string
+        default: ""
       bc_country:
         description: "BC country code (e.g. w1, de, us)"
         required: false
@@ -321,6 +338,11 @@ jobs:
       BC_VERSION: ${{ inputs.bc_version }}
       BC_COUNTRY: ${{ inputs.bc_country }}
       BC_TYPE: ${{ inputs.bc_type }}
+      # Where the extracted artifacts live. Job-level so the download step and
+      # docker-compose's bind mount cannot disagree about the path — which is
+      # what makes a warm cache visible to the container instead of being
+      # re-downloaded into it.
+      BC_ARTIFACTS_DIR: ${{ inputs.artifact_cache_dir != '' && inputs.artifact_cache_dir || format('{0}/artifact-cache', github.workspace) }}/${{ inputs.bc_version }}
 
     steps:
       # ─── Phase 1: cheap parallel-friendly checkouts ──────────────────
@@ -348,12 +370,11 @@ jobs:
       - name: Download BC artifacts + pull docker images (parallel)
         env:
           BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
-          BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache/${{ inputs.bc_version }}
           BC_ARTIFACT_URL: ${{ inputs.bc_artifact_url }}
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin DOWNLOAD "Download BC artifacts + pull docker images"
-          mkdir -p "artifact-cache/$BC_VERSION"
+          mkdir -p "$BC_ARTIFACTS_DIR"
           (
             # Two forms of download-artifacts.sh: the 2-arg form takes a
             # fully-qualified app URL and derives /platform from it (this is
@@ -364,11 +385,11 @@ jobs:
             if [ -n "$BC_ARTIFACT_URL" ]; then
               bc-linux/scripts/download-artifacts.sh \
                 "$BC_ARTIFACT_URL" \
-                "$PWD/artifact-cache/$BC_VERSION"
+                "$BC_ARTIFACTS_DIR"
             else
               bc-linux/scripts/download-artifacts.sh \
                 "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" \
-                "$PWD/artifact-cache/$BC_VERSION"
+                "$BC_ARTIFACTS_DIR"
             fi
           ) &
           ARTIFACT_PID=$!
@@ -418,7 +439,7 @@ jobs:
           done
           KEEP_IDS=$(python3 bc-linux/scripts/resolve-keep-app-ids.py \
             $ARGS \
-            --artifact-dir "artifact-cache/$BC_VERSION")
+            --artifact-dir "$BC_ARTIFACTS_DIR")
           echo "Resolved keep set: $KEEP_IDS"
           echo "BC_CLEAR_ALL_APPS=selective" >> "$GITHUB_ENV"
           echo "BC_KEEP_APP_IDS=$KEEP_IDS" >> "$GITHUB_ENV"
@@ -469,11 +490,19 @@ jobs:
       # several steps (setup .NET, install AL, compile) run during that
       # boot window in parallel.
       - name: Start BC on Linux (background)
-        env:
-          BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache/${{ inputs.bc_version }}
         working-directory: bc-linux
         run: |
           bash scripts/workflow-summary.sh begin BC_BOOT "BC startup (background → wait for healthy)"
+          # Clear any leftover compose state before starting. On a GitHub-hosted
+          # runner this is a no-op (fresh VM, nothing to remove). On a self-hosted
+          # one the previous job's bc/sql containers may still be running, and
+          # `docker compose up -d` adopts a running container instead of recreating
+          # it — the healthcheck then goes green in seconds against the PREVIOUS
+          # run's database and published apps, which looks like a very fast pass.
+          # Named volumes are kept on purpose: the entrypoint stamps /bc/service
+          # and reuses it only when it matches this platform + image, so the warm
+          # path stays warm without going stale.
+          docker compose down --remove-orphans 2>/dev/null || true
           docker compose up -d
           echo "BC container started in background — continuing with other work."
 
@@ -649,7 +678,7 @@ jobs:
           done
           python3 bc-linux/scripts/stage-symbols.py \
             $ARGS \
-            --artifact-dir "artifact-cache/$BC_VERSION" \
+            --artifact-dir "$BC_ARTIFACTS_DIR" \
             --out-dir symbols \
             || true   # warnings about unresolved deps are non-fatal; AL compile gives the precise error if any
           echo "Staged $(ls symbols/*.app 2>/dev/null | wc -l) symbol files"

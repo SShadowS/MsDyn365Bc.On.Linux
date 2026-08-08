@@ -326,37 +326,46 @@ same way the warm service tier and warm artifact cache are.
 
 ## Measurements
 
-GitHub-hosted `ubuntu-22.04`, 4 vCPU, BC 28.1 `w1`, criu 4.2.1 — the whole
-feature through `scripts/snapshot.sh`, with the containers **removed** between
-create and restore and the database reloaded into a **fresh** SQL container.
-Four runs:
+Two machines, and they say different things. **Quote the one that matches your
+hardware**, because the ratio depends on it far more than expected.
 
-| | n | mean | range |
-|---|---|---|---|
-| cold boot to BC serving OData | 4 | **130s** | 108-143s |
-| **restore to BC serving OData** | 4 | **47s** | 43-50s |
-| create, paid once per key | 4 | ~110s | checkpoint alone 43-56s |
+### A real machine — Ryzen 5 5600X, 12 threads, 31 GB, btrfs, kernel 7.1.4
 
-**~85s saved per run, roughly 3x.** Both figures are *container up → OData 200*;
-they do not include artifact fetch, AL compile, app publish or tests.
+| rung | median | min-max |
+|---|---|---|
+| warm (volumes kept, no snapshot) | **70s** | 68-71 |
+| restore (snapshot mode) | **50s** | 50-51 |
+| checkpoint create | 21s | — |
 
-Two honesty notes on those numbers:
+**20s saved, 1.4x.** Not the 3x the hosted runners suggested, and the reason is
+the baseline: this box boots BC in 70s, so there is far less startup to skip.
 
-- **The cold-boot spread is wide** (108-143s, stdev ~14) and is runner variance,
-  not anything this repo controls. Quote the ratio, not a single pair.
-- **The restore is far more stable than the boot it replaces** (43-50s), which
-  is itself part of the value: it removes the most variable phase of the job.
+### A GitHub-hosted runner — 4 vCPU
 
-The check that matters is not in the table: after every restore, an app that did
-not exist when the snapshot was taken is compiled and published into the
-restored tenant, and returns HTTP 200. A boot check alone is not evidence —
-`StartupHook`'s reverted Patch #30 passed one and was catastrophic.
+| rung | median | min-max |
+|---|---|---|
+| cold boot | 130s | 108-143 |
+| restore | 47s | 43-50 |
 
-**Why 47s and not the 25-30s the probe reported.** The probe measured only the
-`docker start --checkpoint` → OData window, with SQL already up and the database
-already restored by a previous step. The 47s here is everything a real run pays:
-starting SQL, restoring a 539 MB backup into it, copying the 2.1 GB checkpoint
-into the new container's directory, and then the restore itself.
+**~85s saved, ~2.8x.**
+
+### What that comparison actually shows
+
+Look at the restores: **47s hosted, 50s on a machine that is nearly twice as
+fast at everything else.** The restore barely moved. So it is dominated by costs
+that do not shrink with CPU — starting SQL, restoring a 539 MB backup, copying a
+2.1 GB checkpoint, and criu mapping it back in — while the cold boot it replaces
+*is* CPU-bound and nearly halves on better hardware.
+
+The practical consequence: **the faster your machine, the smaller the win.**
+A slow 2-vCPU CI box has the most to gain; a fast workstation the least. Do not
+quote 2.8x for a machine like the one above.
+
+That also means the 50s is the number worth attacking, and it has not been
+broken down yet — `snapshot.sh restore` now logs its three phases separately
+(sql + database, checkpoint staging, criu + readiness) so the next run says
+where it goes. If SQL and the database restore turn out to be a third of it,
+keeping the sql container up between jobs recovers that directly.
 
 ### Not reproducible on Windows
 

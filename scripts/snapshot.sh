@@ -591,7 +591,8 @@ restore() {
     log "RESTORE DATABASE failed — cold boot:"; echo "$rsout" | tail -6 >&2
     return 1
   fi
-  log "database restored"
+  log "database restored (sql up + login + restore: $(( $(date +%s) - t0 ))s)"
+  local t_db; t_db=$(date +%s)
 
   # The container has to exist with the same configuration before its process
   # image can be restored into it, and it must not be STARTED — starting it
@@ -613,6 +614,8 @@ restore() {
   [ -n "$cid" ] || { log "could not create the bc container — cold boot"; return 1; }
   # The new container has a new id, so its checkpoint directory is a new path.
   _import_checkpoint "$s/checkpoint" "$cid"
+  log "checkpoint staged into the new container ($(( $(date +%s) - t_db ))s)"
+  local t_cp; t_cp=$(date +%s)
   if ! docker start --checkpoint cp1 "$cid" 2>/tmp/snapshot-restore.err; then
     log "restore failed — cold boot:"; sed -n 1,5p /tmp/snapshot-restore.err >&2
     grep -E 'Error \(|killed by signal' /tmp/criu-work/criu.log 2>/dev/null | tail -5 >&2 || true
@@ -632,6 +635,7 @@ restore() {
     return 1
   fi
   _mark_ready
+  log "criu restore + OData ready: $(( $(date +%s) - t_cp ))s"
   log "restored and serving in $(( $(date +%s) - t0 ))s"
 }
 

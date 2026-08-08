@@ -289,7 +289,7 @@ jobs:
             # looks the same and classifies as "other".
             DUMPLOG="/run/containerd/io.containerd.runtime.v2.task/moby/$CID/criu-dump.log"
             echo "--- criu-dump.log ---"
-            sudo tail -40 "$DUMPLOG" 2>/dev/null || sudo find /run/containerd /var/lib/docker -name 'criu-dump.log' -exec tail -40 {} \; 2>/dev/null || echo "(criu-dump.log not found)"
+            sudo grep -E "Error \(" "$DUMPLOG" 2>/dev/null | tail -15 || sudo tail -40 "$DUMPLOG" 2>/dev/null || echo "(criu-dump.log not found)"
             sudo cp "$DUMPLOG" ./criu-dump.log 2>/dev/null || true
             # Put it where a phone can read it: the run summary, not 1700 log lines.
             {
@@ -342,7 +342,22 @@ jobs:
           ST=$(docker inspect --format '{{.State.Status}}' "$CID")
           [ "$ST" = "exited" ] || { echo "::error::refusing to 'restore' a container that is $ST"; exit 1; }
           T0=$(date +%s)
-          docker start --checkpoint cp1 "$CID"
+          RLOG="/run/containerd/io.containerd.runtime.v2.task/moby/$CID/criu-restore.log"
+          if ! docker start --checkpoint cp1 "$CID" 2>restore.err; then
+            cat restore.err
+            # "type RESTORE errno 0" names no reason -- it is in this file, the
+            # restore-side twin of criu-dump.log.
+            echo "--- criu-restore.log (Error lines) ---"
+            sudo grep -E "Error \(" "$RLOG" 2>/dev/null | tail -15 || sudo tail -30 "$RLOG" 2>/dev/null || echo "(no restore log found)"
+            sudo cp "$RLOG" ./criu-restore.log 2>/dev/null || true
+            {
+              echo "### Restore failed"
+              echo '```'
+              sudo grep -E "Error \(" ./criu-restore.log 2>/dev/null | tail -10 || head -c 400 restore.err
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           # Readiness is OData answering, not the container being "up".
           for i in $(seq 1 180); do
             code=$(docker compose exec -T bc curl -s -o /dev/null -w '%{http_code}' \
@@ -451,8 +466,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: criu-dump-log
-          path: criu-dump.log
+          name: criu-logs
+          path: |
+            criu-dump.log
+            criu-restore.log
           if-no-files-found: ignore
 
       - name: Diagnostics on failure

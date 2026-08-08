@@ -290,6 +290,8 @@ _create_failed() {
   [ "$rc" -eq 0 ] && return 0
   log "create failed — discarding the partial snapshot and bringing bc back"
   [ -n "${CREATE_STORE:-}" ] && _rm_store "$CREATE_STORE"
+  # The stamp may not exist yet, so _rm_store cannot have found the image name.
+  docker image rm -f "bc-snapshot:$(snapshot_key 2>/dev/null || echo none)" >/dev/null 2>&1 || true
   docker compose up -d --wait >/dev/null 2>&1 || true
   return "$rc"
 }
@@ -307,7 +309,15 @@ _prepare_sqldir() {
 # The checkpoint is written by the docker daemon, so it is root-owned and mode
 # 700 whatever the caller is. Deleting or sizing the store therefore needs sudo
 # on any machine where the runner is not root -- which is all of them.
-_rm_store() { [ -n "${1:-}" ] || return 0; rm -rf "${1:?}" 2>/dev/null || sudo rm -rf "${1:?}"; }
+# The store is only half of a snapshot; the other half is the committed rootfs
+# image. Dropping one without the other leaves either a snapshot that cannot
+# restore or an image nothing will ever use, so they go together.
+_rm_store() {
+  [ -n "${1:-}" ] || return 0
+  local img; img=$(sed -n 's|^rootfs_image=||p' "$1/$STAMP_NAME" 2>/dev/null | head -1)
+  [ -n "$img" ] && docker image rm -f "$img" >/dev/null 2>&1 || true
+  rm -rf "${1:?}" 2>/dev/null || sudo rm -rf "${1:?}"
+}
 _du_store() { sudo du -sh "$1" 2>/dev/null | cut -f1 || echo "?"; }
 
 _bc_odata() {
@@ -386,6 +396,22 @@ create() {
   sudo cp -a "$(_ckpt_path "$cid")/cp1" "$s/checkpoint/cp1"
   [ -d "$s/checkpoint/cp1" ] || die "checkpoint did not copy into the store"
 
+  # The checkpoint is only half of what the process needs: criu references open
+  # files by PATH and re-opens them on restore, and some of those live in the
+  # container's read-write layer rather than in a volume. The entrypoint's
+  # /tmp/bc-stdin FIFO is one — NST holds it as stdin and the entrypoint keeps
+  # fd 3 on it — so restoring into a freshly created container failed with
+  #
+  #   Can't open fake fifo [tmp/bc-stdin]: No such file or directory
+  #
+  # Committing the stopped container captures that layer, and restore creates
+  # its container from the commit instead of from the bc-runner image. This is
+  # general: it also covers /tmp/bc-ready and anything else BC wrote outside a
+  # volume, rather than enumerating files we happen to know about.
+  local img="bc-snapshot:$(snapshot_key)"
+  docker commit "$cid" "$img" >/dev/null
+  log "rootfs committed as $img"
+
   # AFTER the checkpoint, so the database matches the frozen process exactly.
   _prepare_sqldir
   _sqlcmd -Q "BACKUP DATABASE [CRONUS] TO DISK='/sqlsnap/cronus.bak' WITH COPY_ONLY, INIT, COMPRESSION" >/dev/null
@@ -400,6 +426,7 @@ create() {
   { snapshot_key_long
     echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "service_stamp=$(_service_volume_stamp)"
+    echo "rootfs_image=$img"
   } > "$s/$STAMP_NAME"
   log "snapshot stored in $s ($(_du_store "$s"))"
 
@@ -492,7 +519,19 @@ restore() {
   # The container has to exist with the same configuration before its process
   # image can be restored into it, and it must not be STARTED — starting it
   # would run the entrypoint and cold-boot BC.
-  docker compose create bc >/dev/null
+  #
+  # It is created from the committed rootfs, not the bc-runner image, so the
+  # files criu will re-open are present (see create()). BC_RUNNER_IMAGE is set
+  # for THIS COMMAND ONLY and deliberately not exported: it appears in bc's
+  # compose service, so exporting it would change the config component of the
+  # key and every later run would miss.
+  local img; img=$(sed -n 's|^rootfs_image=||p' "$s/$STAMP_NAME" | head -1)
+  if [ -z "$img" ] || ! docker image inspect "$img" >/dev/null 2>&1; then
+    log "the snapshot's rootfs image ${img:-<none>} is not on this machine — cold boot"
+    log "  (docker image prune removes it; the snapshot alone is not enough)"
+    return 1
+  fi
+  BC_RUNNER_IMAGE="$img" docker compose create bc >/dev/null
   local cid; cid=$(docker compose ps -aq bc)
   [ -n "$cid" ] || { log "could not create the bc container — cold boot"; return 1; }
   # The new container has a new id, so its checkpoint directory is a new path.

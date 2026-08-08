@@ -24,12 +24,23 @@ Two files, valid only **together**:
 |---|---|---|
 | `checkpoint/` | ~2.1 GB | the frozen NST process image |
 | `cronus.bak` | ~540 MB | the database it was booted against |
+| `bc-snapshot:<key>` | small | a docker image holding the container's read-write layer |
 
-Neither restores on its own. The checkpoint holds a process whose memory refers
-to that database's schema, its published-app metadata, its license and its
-session state. Restore it against a different database and you get a BC that
-answers requests and is quietly wrong. They are written and read as a pair under
+None of them restores on its own. The checkpoint holds a process whose memory
+refers to that database's schema, its published-app metadata, its license and
+its session state. Restore it against a different database and you get a BC that
+answers requests and is quietly wrong. They are written and read as a set under
 one key, and **the key is the whole safety story.**
+
+The third one is easy to overlook. criu references open files by *path* and
+re-opens them on restore, and some of those live in the container's read-write
+layer rather than in a volume — the entrypoint's `/tmp/bc-stdin` FIFO, which NST
+holds as stdin, is one. A container recreated from the plain `bc-runner` image
+does not have them, so restore fails with `Can't open fake fifo [tmp/bc-stdin]`.
+Committing the stopped container captures that layer, and restore builds its
+container from the commit. Note this lives in the local docker image store, not
+in `BC_SNAPSHOT_DIR`: `docker image prune` removes it and the snapshot then
+declines to restore rather than failing obscurely.
 
 ## Turning a machine on
 

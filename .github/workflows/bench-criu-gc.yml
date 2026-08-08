@@ -23,6 +23,12 @@ permissions:
 # SHARED with bench-selfhosted.yml on purpose: both bind BC's ports directly on
 # the host (snapshot mode needs host networking) and drive the same compose
 # project. Two at once would fight over both.
+#
+# CONSEQUENCE, learned the hard way: GitHub keeps at most ONE pending run per
+# group, and a newly queued run cancels the pending one. bench-selfhosted.yml
+# triggers on scripts/snapshot.sh, so any edit to that file while this sweep is
+# waiting will cancel it — which is exactly how this workflow's first run died.
+# To get a sweep through, push a change that touches ONLY this file.
 concurrency:
   group: bench-selfhosted
   cancel-in-progress: false
@@ -60,6 +66,18 @@ jobs:
           }
           bash scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$BC_ARTIFACTS_DIR"
 
+      # Four configurations write a ~3.2 GB store each, and the sweep discards
+      # each one before the next. If it dies partway, that reclaim does not
+      # happen — so record what was there before, to tell a leak from a
+      # pre-existing pile.
+      - name: Disk before
+        run: |
+          df -Ph /var/cache/bc-linux /var/tmp 2>/dev/null || df -Ph
+          docker run --rm -v /tmp:/t:ro busybox sh -c \
+            'df -Ph /t; echo "ctrd staging: $(ls -d /t/ctrd-checkpoint* 2>/dev/null | wc -l) dirs"' \
+            2>/dev/null || true
+          ./scripts/snapshot.sh status || true
+
       - name: Sweep
         run: |
           set -o pipefail
@@ -95,3 +113,8 @@ jobs:
         run: |
           docker compose down --remove-orphans || true
           ./scripts/snapshot.sh reap || true
+          # The sweep discards each store as it goes, but a run that died
+          # partway leaves one behind. This is a developer workstation; do not
+          # leave 3.2 GB of it consumed by a cancelled benchmark.
+          ./scripts/snapshot.sh discard || true
+          df -Ph /var/cache/bc-linux 2>/dev/null || true

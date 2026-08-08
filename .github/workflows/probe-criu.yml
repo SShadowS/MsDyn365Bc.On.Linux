@@ -282,6 +282,14 @@ jobs:
           # dir down on failure, taking criu-restore.log with it before any find
           # can run. criu takes work-dir/log-file from this same config, so point
           # it somewhere that outlives the container.
+          # Run 13's restore died with ENOMEM (-12 shown as 0xfffffffffffffff4)
+          # remapping one region. BC's NST has RSS 2.24 GB but VmSize 263 GB --
+          # .NET's GC reserves vast virtual ranges. Restoring a quarter-terabyte
+          # of address-space reservations is precisely what the heuristic
+          # overcommit mode refuses and what exhausts the default 65530 mapping
+          # cap, and criu must recreate every one of them.
+          sudo sysctl -w vm.overcommit_memory=1 vm.max_map_count=1048576
+          free -g | awk 'NR==2{print "  host RAM used/total: "$3"/"$2" GB"}'
           sudo mkdir -p /tmp/criu-work && sudo chmod 777 /tmp/criu-work
           printf 'tcp-established\ntcp-close\nfile-locks\next-unix-sk\nlink-remap\nghost-limit 512M\nwork-dir /tmp/criu-work\nlog-file criu.log\n' \
             | sudo tee /etc/criu/runc.conf

@@ -442,7 +442,22 @@ create() {
   t0=$(date +%s)
   # --leave-running=false: the process must really stop, otherwise the backup
   # below races a BC that is still writing and the two halves disagree.
-  docker checkpoint create --leave-running=false "$cid" cp1
+  # The daemon's own message says only "criu failed: type DUMP" and names a log
+  # path. THAT file has the reason, and create() was the last place in this
+  # script still not printing it — restore() has done so since the segfault
+  # hunt. runc.conf pins work-dir to /tmp/criu-work, so the log is there;
+  # containerd's task dir is checked too because the daemon quotes that path.
+  if ! docker checkpoint create --leave-running=false "$cid" cp1 2>/tmp/snapshot-dump.err; then
+    log "docker checkpoint create failed:"
+    sed -n 1,3p /tmp/snapshot-dump.err >&2
+    log "--- criu dump log ---"
+    { grep -hE "Error \(|Warn \(" /tmp/criu-work/criu.log 2>/dev/null \
+        || tail -20 /tmp/criu-work/criu.log 2>/dev/null \
+        || echo "(no /tmp/criu-work/criu.log)"; } | tail -20 >&2
+    local tasklog="/run/containerd/io.containerd.runtime.v2.task/moby/$cid/criu-dump.log"
+    [ -r "$tasklog" ] && { log "--- $tasklog ---"; grep -hE "Error \(" "$tasklog" | tail -10 >&2; }
+    die "checkpoint failed — see the criu log above"
+  fi
   [ "$(docker inspect --format '{{.State.Status}}' "$cid")" = "exited" ] \
     || die "bc still running after checkpoint — nothing was captured"
   log "checkpoint written in $(( $(date +%s) - t0 ))s"

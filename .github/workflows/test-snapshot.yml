@@ -69,8 +69,15 @@ jobs:
 
       # The key must behave before anything expensive runs: it is the whole
       # safety story, and it needs no docker daemon and no BC.
-      - name: Key behaviour
-        run: ./scripts/test-snapshot-key.sh
+      # Both cheap, both before anything that costs a BC boot. The shellcheck
+      # pass earns its place: run 7 burned a six-minute run on `sed` exiting 2
+      # for a missing file, which `set -e` turned into a bare exit-2 with no
+      # message before the checkpoint was even attempted.
+      - name: Key behaviour and shell lint
+        run: |
+          set -e
+          ./scripts/test-snapshot-key.sh
+          shellcheck -S warning -e SC2034 scripts/snapshot.sh
 
       - name: Install criu and enable docker experimental
         run: |

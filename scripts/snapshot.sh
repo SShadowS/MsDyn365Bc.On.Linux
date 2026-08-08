@@ -38,9 +38,6 @@
 # There is no path where a failed restore leaves a half-restored BC running.
 set -euo pipefail
 
-# Resolved so the script works from any cwd; compose commands run where the
-# caller is, which is the repo root in every documented flow.
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STAMP_NAME=".bc-snapshot-stamp"
 
 log()  { echo "[snapshot] $*" >&2; }
@@ -314,7 +311,13 @@ _prepare_sqldir() {
 # restore or an image nothing will ever use, so they go together.
 _rm_store() {
   [ -n "${1:-}" ] || return 0
-  local img; img=$(sed -n 's|^rootfs_image=||p' "$1/$STAMP_NAME" 2>/dev/null | head -1)
+  # The stamp is usually absent here — _rm_store's whole job is clearing a store
+  # that is missing, partial, or being rebuilt. `sed` exits 2 on an unreadable
+  # file, and under `set -e` an assignment from a command substitution carries
+  # that status straight out of the script: run 7 died at exit 2 with no message
+  # before it ever reached the checkpoint. Guard the read, do not silence it.
+  local img=""
+  [ -f "$1/$STAMP_NAME" ] && img=$(sed -n 's|^rootfs_image=||p' "$1/$STAMP_NAME" | head -1)
   [ -n "$img" ] && docker image rm -f "$img" >/dev/null 2>&1 || true
   rm -rf "${1:?}" 2>/dev/null || sudo rm -rf "${1:?}"
 }
@@ -374,7 +377,7 @@ create() {
   _apply_sysctls
   local s cid t0
   s=$(_store) || die "cannot compute a snapshot key (run: scripts/snapshot.sh key)"
-  cid=$(docker compose ps -q bc)
+  cid=$(docker compose ps -q bc || true)
   [ -n "$cid" ] || die "no running bc container"
   [ "$(_bc_odata)" = "200" ] || die "bc is not serving OData — refusing to snapshot a BC that is not healthy"
 
@@ -408,7 +411,8 @@ create() {
   # its container from the commit instead of from the bc-runner image. This is
   # general: it also covers /tmp/bc-ready and anything else BC wrote outside a
   # volume, rather than enumerating files we happen to know about.
-  local img="bc-snapshot:$(snapshot_key)"
+  local img
+  img="bc-snapshot:$(snapshot_key)"
   docker commit "$cid" "$img" >/dev/null
   log "rootfs committed as $img"
 
@@ -472,7 +476,7 @@ restore() {
   preflight || { log "host cannot restore — cold boot"; return 1; }
 
   local want have
-  want=$(sed -n 's|^service_stamp=||p' "$s/$STAMP_NAME" | head -1)
+  want=$(sed -n 's|^service_stamp=||p' "$s/$STAMP_NAME" 2>/dev/null | head -1 || true)
   have=$(_service_volume_stamp)
   if [ "$want" != "$have" ]; then
     log "the bc-service volume does not match this snapshot — cold boot"
@@ -508,8 +512,12 @@ restore() {
         CREATE LOGIN [$dbu] WITH PASSWORD = '$dbp', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;
     ALTER SERVER ROLE sysadmin ADD MEMBER [$dbu];" >/dev/null
   local d l
-  d=$(_sqlcmd -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" | head -1 | cut -f1)
-  l=$(_sqlcmd -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" | head -2 | tail -1 | cut -f1)
+  d=$(_sqlcmd -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" 2>/dev/null | head -1 | cut -f1 || true)
+  l=$(_sqlcmd -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" 2>/dev/null | head -2 | tail -1 | cut -f1 || true)
+  if [ -z "$d" ] || [ -z "$l" ]; then
+    log "could not read the backup's file list — cold boot"
+    return 1
+  fi
   _sqlcmd -Q "
     RESTORE DATABASE [CRONUS] FROM DISK='/sqlsnap/cronus.bak'
     WITH MOVE '$d' TO '/var/opt/mssql/data/CRONUS.mdf',

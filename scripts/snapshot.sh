@@ -790,6 +790,13 @@ restore() {
   done
   [ "$(docker compose ps --format '{{.Health}}' sql 2>/dev/null)" = healthy ] \
     || { log "sql never became healthy — cold boot"; return 1; }
+  # Split, because the three parts have completely different fixes. Container
+  # start is bounded by the healthcheck's poll interval; the login is one round
+  # trip; the RESTORE is the only part a SQL Server database snapshot could
+  # replace, and only when the container persists (the data dir is a tmpfs, so
+  # a snapshot dies with it).
+  local t_sqlup; t_sqlup=$(date +%s)
+  log "  sql container up and healthy in $(( t_sqlup - t0 ))s"
 
   # master went with the previous container (the data dir is a tmpfs), so the
   # BC login has to be recreated exactly as entrypoint.sh Step 3 makes it.
@@ -800,8 +807,13 @@ restore() {
     ALTER SERVER ROLE sysadmin ADD MEMBER [$dbu];" >/dev/null 2>&1 || {
       log "could not create the BC login on the fresh sql container — cold boot"; return 1; }
   local d l
-  d=$(_sqlcmd -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" 2>/dev/null | head -1 | cut -f1 || true)
-  l=$(_sqlcmd -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" 2>/dev/null | head -2 | tail -1 | cut -f1 || true)
+  # ONE round trip, not two. This ran the identical query twice -- each one a
+  # `docker compose exec` spawning sqlcmd in the container and re-reading the
+  # 539 MB backup's header -- to take row 1 from the first and row 2 from the
+  # second.
+  local fl; fl=$(_sqlcmd -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" 2>/dev/null || true)
+  d=$(printf '%s\n' "$fl" | head -1 | cut -f1)
+  l=$(printf '%s\n' "$fl" | head -2 | tail -1 | cut -f1)
   if [ -z "$d" ] || [ -z "$l" ]; then
     log "could not read the backup's file list — cold boot"
     return 1
@@ -814,7 +826,7 @@ restore() {
     log "RESTORE DATABASE failed — cold boot:"; echo "$rsout" | tail -6 >&2
     return 1
   fi
-  log "database restored (sql up + login + restore: $(( $(date +%s) - t0 ))s)"
+  log "database restored (sql up + login + restore: $(( $(date +%s) - t0 ))s; restore alone $(( $(date +%s) - t_sqlup ))s)"
   local t_db; t_db=$(date +%s)
 
   # The container has to exist with the same configuration before its process

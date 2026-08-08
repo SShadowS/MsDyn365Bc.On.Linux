@@ -314,11 +314,31 @@ _root_read() {
 # They are root-owned, so reap them through the docker socket. The glob is
 # anchored to containerd's own prefix; a no-match leaves the literal string,
 # which rm -rf ignores.
+#
+# /tmp UNCONDITIONALLY, plus TMPDIR when that differs. The path is the DAEMON's
+# TMPDIR, which this script cannot read; /tmp is the daemon's default and is
+# where they were actually found. Keying the reap on our own TMPDIR would have
+# cleaned the wrong directory on any runner that sets one.
+# A `-v` source is resolved by the daemon, so this reaches the HOST's /tmp
+# whether or not the caller shares it — the distinction that made run 12's
+# `df` misleading.
 _reap_ctrd_staging() {
-  local dir="${TMPDIR:-/tmp}"
-  docker run --rm -v "$dir":/t --entrypoint sh "$(_bc_image_ref)" -c \
-    'for d in /t/ctrd-checkpoint*; do case "$d" in */ctrd-checkpoint\*) ;; *) rm -rf "$d";; esac; done' \
-    >/dev/null 2>&1 || true
+  local dir
+  for dir in /tmp "${TMPDIR:-/tmp}"; do
+    docker run --rm -v "$dir":/t --entrypoint sh "$(_bc_image_ref)" -c \
+      'for d in /t/ctrd-checkpoint*; do case "$d" in */ctrd-checkpoint\*) ;; *) rm -rf "$d";; esac; done' \
+      >/dev/null 2>&1 || true
+    [ "$dir" = "${TMPDIR:-/tmp}" ] && break
+  done
+}
+
+# Free space on the daemon's staging filesystem, from the daemon's own view, in
+# MB — plus its type. `df` in the job answers about a different /tmp on any
+# machine where the runner has a private one, which is how a 16 GB tmpfs at
+# 100% got reported as 1.1 TB free.
+_host_tmp_stat() {  # prints "<fstype> <free_mb>"
+  docker run --rm -v /tmp:/t:ro --entrypoint sh "$(_bc_image_ref)" -c \
+    'printf "%s %s\n" "$(stat -f -c %T /t)" "$(df -Pm /t | awk "NR==2{print \$4}")"' 2>/dev/null
 }
 
 _export_checkpoint() {  # <container-id> <dest-dir>   result is owned by us
@@ -476,6 +496,21 @@ _check_space() {
       ok=1
     fi
   done
+  # The staging filesystem is the one that actually ran out, and none of the
+  # checks above look at it: containerd copies the whole ~2.1 GB checkpoint into
+  # the DAEMON's /tmp for every `docker checkpoint create` and never removes it.
+  # On a distro where that is a tmpfs, a few runs fill RAM. What then fails is
+  # not the checkpoint but whatever writes next -- runc's few-KB process spec --
+  # so the message names a file nobody was thinking about.
+  local htmp; htmp=$(_host_tmp_stat || true)
+  if [ -n "$htmp" ]; then
+    local htype hfree; htype=${htmp%% *}; hfree=${htmp##* }
+    if [ "$htype" = tmpfs ] && [ "${hfree:-0}" -lt 4096 ]; then
+      log "the docker daemon stages checkpoints in /tmp, which is $htype with only $((hfree/1024)) GB free"
+      log "  ~2.1 GB is needed per checkpoint; stale staging is reaped with: scripts/snapshot.sh reap"
+      ok=1
+    fi
+  fi
   [ "$ok" = 0 ] || log "free space: $(df -Ph "$store" /tmp 2>/dev/null | awk 'NR>1{printf "%s=%s free  ", $6, $4}')"
   return $ok
 }
@@ -513,6 +548,11 @@ create() {
   s=$(_store) || die "cannot compute a snapshot key (run: scripts/snapshot.sh key)"
   cid=$(docker compose ps -q bc || true)
   [ -n "$cid" ] || die "no running bc container"
+  # BEFORE the space check, not only after the checkpoint: what a previous run
+  # (or a crash between checkpoint and reap) left behind is exactly the space
+  # this one is about to need, and reclaiming it first turns a hard failure
+  # into a no-op.
+  _reap_ctrd_staging
   _check_space || die "not enough free space to take a snapshot"
   local odata; odata=$(_bc_odata)
   if [ "$odata" != "200" ]; then
@@ -687,6 +727,9 @@ restore() {
   fi
 
   _verify_host_config || return 1
+  # `docker start --checkpoint` stages through the daemon's /tmp the same way
+  # the dump does, so a restore can be killed by leftovers from a create.
+  _reap_ctrd_staging
   local t0; t0=$(date +%s)
 
   # SQL first: the restored NST wakes holding a connection pool whose peer is
@@ -758,6 +801,13 @@ restore() {
     _discard "$s" "restore failed"
     return 1
   fi
+  # Split deliberately: `docker start --checkpoint` returning is criu having
+  # mapped the process back in, which is the part a faster disk speeds up. The
+  # wait below is NST re-establishing its SQL connections and re-arming timers,
+  # which it does at its own pace. Only the first shrinks on better hardware, so
+  # a single combined number cannot say whether a machine is worth upgrading.
+  local t_criu; t_criu=$(date +%s)
+  log "criu restore returned in $(( t_criu - t_cp ))s"
 
   # A restore that returns 0 is not a working BC. Nothing downstream may run
   # until OData actually answers.
@@ -772,7 +822,7 @@ restore() {
     return 1
   fi
   _mark_ready
-  log "criu restore + OData ready: $(( $(date +%s) - t_cp ))s"
+  log "bc answered OData $(( $(date +%s) - t_criu ))s after the restore returned"
   log "restored and serving in $(( $(date +%s) - t0 ))s"
 }
 
@@ -790,6 +840,7 @@ case "${1:-}" in
   preflight) preflight ;;
   create)    create ;;
   restore)   restore ;;
+  reap)      _reap_ctrd_staging; log "reaped containerd checkpoint staging"; _host_tmp_stat | awk '{printf "  daemon /tmp: %s, %d GB free\n", $1, $2/1024}' ;;
   *) cat >&2 <<USAGE
 usage: scripts/snapshot.sh <command>
 
@@ -798,6 +849,9 @@ usage: scripts/snapshot.sh <command>
   preflight  can this host checkpoint at all
   create     checkpoint a healthy BC + back up its database into the store
   restore    bring BC up from the store; non-zero means "cold boot instead"
+  reap       delete containerd's leftover checkpoint staging from the daemon's
+             /tmp (~2.1 GB each, never cleaned up by docker; on a tmpfs /tmp
+             they fill RAM and the ENOSPC surfaces as unrelated failures)
 
 Opt-in per MACHINE, not per pipeline: enabled when BC_SNAPSHOT_DIR is set or one
 of these directories exists and is writable --

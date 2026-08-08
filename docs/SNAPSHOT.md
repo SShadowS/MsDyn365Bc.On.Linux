@@ -126,6 +126,49 @@ networking (Docker cannot rebuild a bridge network namespace on restore) and
 mounts the backup directory into `sql` (`RESTORE FROM DISK` reads SQL Server's
 own filesystem). `preflight` refuses to run without it.
 
+### containerd leaks 2.1 GB into `/tmp` per checkpoint
+
+`docker checkpoint create` stages the whole checkpoint in
+`/tmp/ctrd-checkpoint<random>` on the **docker daemon's** filesystem and never
+removes it. Nothing in docker cleans these up — not `docker system prune`, not
+container removal.
+
+On any distro where `/tmp` is a tmpfs — Arch and Fedora among them — that is
+RAM. Seven of them were found after one benchmark series, about 15 GB, on a
+machine with a 16 GB tmpfs.
+
+What then fails is not the checkpoint. It is whatever writes to `/tmp` next,
+which is typically runc's few-KB process spec, so the message names a file
+nobody was thinking about:
+
+```
+write /tmp/runc-process3593261234: no space left on device
+```
+
+Across five runs the same exhaustion appeared as a failed restore, a bare `criu
+failed: type DUMP`, a missing criu log, and "bc is not serving OData". None of
+them said "disk full" until the raw stderr was read.
+
+`snapshot.sh` now reaps this staging before and after every `create` and before
+every `restore`, and `_check_space` refuses to start when the daemon's `/tmp` is
+a tmpfs with under 4 GB free. To clear it by hand:
+
+```bash
+scripts/snapshot.sh reap
+```
+
+**Measure it from a container, not from your shell.** A `-v` source path is
+resolved by the daemon, so `docker run --rm -v /tmp:/t:ro busybox df -Ph /t`
+reports the filesystem that actually fills. A CI job — or anything else with a
+private `/tmp` — sees a different one: in run 12 the job's `df` reported 1.1 TB
+free on btrfs while the daemon's 16 GB tmpfs was full, and that reading was
+used to wrongly rule out the tmpfs as the cause.
+
+The same reasoning is why this project's own staging (`/var/tmp/bc-sqlstage`,
+`/var/tmp/criu-work`) is under `/var/tmp` and why `setup-snapshot-host.sh`
+writes `work-dir /var/tmp/criu-work` into `/etc/criu/runc.conf`. Those moves do
+nothing about containerd's, which takes its path from the daemon's `TMPDIR`.
+
 ---
 
 ## The cache key

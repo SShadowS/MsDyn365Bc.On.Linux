@@ -81,9 +81,19 @@ reachable server. What overlaps is the entrypoint's pre-SQL work: the artifact
 copy and the service-tier patching. So the ceiling is the gate itself, ~5-6s,
 whatever else changes.
 
-Below the 10s noise floor stated above — but that floor is for whole matrix
-jobs. The snapshot test's cold-boot figure has landed within ~1s across six
-consecutive runs (137/137/137/137/135/135), which is tight enough to see this.
+**Do not expect to see this in the total boot time.** I claimed the snapshot
+test's cold boot was stable to ~1s, on the strength of four consecutive 137s
+readings. The next run came in at 143s. The real series is
+137/137/137/137/135/135/143 — an **8s spread**, mean 137.3, stdev 2.7 — so a 6s
+effect is not resolvable there, and the 132s reading immediately after the
+change is one sample inside the old band. It is not evidence.
+
+What is measurable is the gate itself, because it is deterministic: the boot
+step now records how long after `sql` started `bc` was allowed to start
+(`GATE:` in the log, and a row in the run summary). That was ~5.8s and should
+now be ~0. The saving is structural — bc's pre-SQL work now overlaps SQL's
+startup instead of following it — and that is the claim, not a wall-clock
+delta measured off one pair of runs.
 
 The entrypoint's SQL wait was unbounded and is now capped
 (`BC_SQL_WAIT_TIMEOUT`, default 600s). That is not optional with the gate gone:

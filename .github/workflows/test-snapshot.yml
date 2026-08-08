@@ -132,6 +132,17 @@ jobs:
           echo "cold_boot=$(( $(date +%s) - T0 ))" >> "$GITHUB_OUTPUT"
           echo "cold boot to healthy: $(( $(date +%s) - T0 ))s"
 
+          # Total boot cannot resolve a ~6s ordering change: it has an 8s spread
+          # across runs (135-143s before the change). So measure the thing that
+          # actually changed, which is deterministic — how long after sql started
+          # did bc's entrypoint get to run? That was the depends_on gate, and it
+          # should now be ~0 rather than ~6s.
+          sq=$(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q sql)")" +%s)
+          bs=$(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q bc)")" +%s)
+          echo "GATE: bc started $((bs - sq))s after sql"
+          echo "gate_s=$((bs - sq))" >> "$GITHUB_OUTPUT"
+          docker compose logs bc 2>&1 | grep -a "SQL Server ready" | head -1 || true
+
       - name: Create the snapshot
         id: create
         run: |
@@ -217,6 +228,7 @@ jobs:
             echo "| step | result |"
             echo "|---|---|"
             echo "| cold boot to healthy | ${{ steps.boot.outputs.cold_boot }}s |"
+            echo "| bc start delayed behind sql | ${{ steps.boot.outputs.gate_s }}s |"
             echo "| create snapshot | ${{ steps.create.outcome }} (${{ steps.create.outputs.create_s }}s) |"
             echo "| **restore after teardown** | **${{ steps.restore.outcome }} (${{ steps.restore.outputs.restore_s }}s)** |"
             echo "| novel app publish | ${{ steps.publish.outcome }} |"

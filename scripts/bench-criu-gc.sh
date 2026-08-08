@@ -91,7 +91,7 @@ for entry in "${CONFIGS[@]}"; do
   cr=$(./scripts/snapshot.sh create 2>&1) || {
     echo "  CREATE FAILED" >&2
     printf '%s\tCREATE-FAIL\t-\t-\n' "$label" >> "$RESULTS"
-    printf '%s\n' "$cr" | tail -5 >&2
+    printf '%s\n' "$cr" | tail -20 >&2
     continue
   }
   vmas=$(printf '%s\n' "$cr" | sed -n 's/.*nst mappings: \([0-9]*\) vmas.*/\1/p' | head -1)
@@ -107,13 +107,27 @@ for entry in "${CONFIGS[@]}"; do
   criu_times="" total_times=""
   for i in $(seq 1 "$ITER"); do
     docker compose rm -sf bc >/dev/null 2>&1 || true
-    out=$(./scripts/snapshot.sh restore 2>&1) || { criu_times="$criu_times FAIL"; continue; }
+    # PRINT the failure. The first version recorded FAIL and dropped $out, so
+    # the two configurations that mattered most -- 1 and 2 heaps, whose
+    # checkpoints are less than half the baseline's -- failed three times each
+    # and said nothing about why. Every swallowed diagnostic in this feature has
+    # cost a full run.
+    if ! out=$(./scripts/snapshot.sh restore 2>&1); then
+      criu_times="$criu_times FAIL"
+      echo "  restore $i FAILED:"
+      printf '%s\n' "$out" | tail -20 | sed 's/^/    /'
+      continue
+    fi
     c=$(printf '%s\n' "$out" | sed -n 's/.*criu restore returned in \([0-9]*\)s.*/\1/p' | head -1)
     t=$(printf '%s\n' "$out" | sed -n 's/.*restored and serving in \([0-9]*\)s.*/\1/p' | head -1)
     criu_times="$criu_times ${c:-?}"; total_times="$total_times ${t:-?}"
     printf '  restore %d: criu %ss, total %ss\n' "$i" "${c:-?}" "${t:-?}"
   done
-  printf '%s\t%s\t%s\t%s\n' "$label" "${vmas:-?}" "${criu_times# }" "${total_times# }" >> "$RESULTS"
+  # Checkpoint SIZE, not just the VMA count. The first sweep proved mappings are
+  # not the variable (they moved 5614 -> 5033 while the checkpoint went
+  # 2.9G -> 1.3G), so the bytes are what the table has to show.
+  csz=$(printf '%s\n' "$ckpt" | sed -n 's/.*, \([0-9.]*[MG]\) total.*/\1/p')
+  printf '%s\t%s\t%s\t%s\t%s\n' "$label" "${vmas:-?}" "${csz:-?}" "${criu_times# }" "${total_times# }" >> "$RESULTS"
 
   # One store at a time: four configurations would otherwise leave ~13 GB behind.
   ./scripts/snapshot.sh discard >/dev/null 2>&1 || true
@@ -123,18 +137,18 @@ log "results"
 python3 - "$RESULTS" <<'PY'
 import statistics, sys
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if l.strip()]
-print(f"  {'configuration':<32}{'vmas':>10}{'criu':>9}{'total':>9}")
+print(f"  {'configuration':<32}{'vmas':>8}{'ckpt':>8}{'criu':>8}{'total':>8}")
 base = None
 for r in rows:
-    label, vmas = r[0], r[1]
+    label, vmas, csz = r[0], r[1], r[2]
     if vmas in ("BOOT-FAIL", "CREATE-FAIL"):
-        print(f"  {label:<32}{vmas:>10}"); continue
+        print(f"  {label:<32}{vmas:>8}"); continue
     def med(s):
         v = [int(x) for x in s.split() if x.isdigit()]
         return statistics.median(v) if v else None
-    c, t = med(r[2]), med(r[3])
+    c, t = med(r[3]), med(r[4])
     if c is None:
-        print(f"  {label:<32}{vmas:>10}{'all failed':>18}"); continue
+        print(f"  {label:<32}{vmas:>8}{csz:>8}{'ALL RESTORES FAILED':>20}"); continue
     rel = ""
     if base is None:
         base = c
@@ -142,11 +156,15 @@ for r in rows:
         rel = f"   criu {base - c:.0f}s faster"
     elif c > base:
         rel = f"   criu {c - base:.0f}s SLOWER"
-    print(f"  {label:<32}{vmas:>10}{c:>8.0f}s{(t or 0):>8.0f}s{rel}")
+    print(f"  {label:<32}{vmas:>8}{csz:>8}{c:>7.0f}s{(t or 0):>7.0f}s{rel}")
 print()
-print("  vmas is the count at checkpoint time. If it barely moves, the GC")
-print("  reservations are a few large mappings and this route is a dead end —")
-print("  criu lazy-pages is then the only remaining lever on the restore.")
+print("  ckpt is the variable that moves: the first sweep saw mappings go")
+print("  5614 -> 5033 (nothing) while the checkpoint went 2.9G -> 1.3G. So the")
+print("  question is whether criu time tracks those BYTES. If a checkpoint at")
+print("  half the size restores in half the time, fewer GC heaps is the lever;")
+print("  if it does not, the cost is elsewhere — containerd stages a full copy")
+print("  of the checkpoint into the daemon's /tmp inside `docker start`, and")
+print("  criu lazy-pages is the remaining option.")
 print()
 print("  A win here is a TRADE: Server GC is the default because it speeds up")
 print("  the parallel Roslyn compile during boot and extension publish. Before")

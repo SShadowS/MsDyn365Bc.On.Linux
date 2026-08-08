@@ -109,7 +109,7 @@ run_rung() {  # run_rung <name> <fn>
     # actually start. "sql up" matched nothing: that phase logs as "database
     # restored (sql up + login + restore: Ns)", so the two phases that bracket
     # criu were silently missing from run 17's breakdown.
-    grep -aE '\[snapshot\] (database restored|checkpoint staged|criu restore|bc answered|restored and serving)' "$lg" \
+    grep -aE '\[snapshot\] (database restored|database reverted|checkpoint staged|criu restore|bc answered|restored and serving)' "$lg" \
       | sed 's/^/      /' || true
     if [ "$r" = FAIL ]; then
       echo "      ---- why it failed (last 15 lines) ----"

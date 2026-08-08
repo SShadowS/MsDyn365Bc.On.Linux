@@ -334,10 +334,45 @@ runtime-DLL `.bak` restore, which also fixes the same bug on a plain
 container restart. If you add anything else that rewrites the service dir
 after NST is up, it needs the same treatment.
 
-The R2R assembly cache is **not** in a volume — it lives under
-`/usr/share/Microsoft/Microsoft Dynamics NAV/<nav>/Server` in the container
-filesystem (1.2 GB on BC 28.1), so it is rebuilt and re-seeded every boot.
-No leak, and no reuse either; moving it into a volume is unexplored.
+### The assembly cache and the DB snapshot only pay off together
+
+Measured 2026-08-08 on a 4-vCPU box, BC 28.1, five configurations, artifacts
+held constant. **Durations are only comparable within this table** — NST
+startup here is 80s against the 31s `CI-STEP-ORDERING.md` records on a GitHub
+runner, so read the shape, not the seconds.
+
+| configuration | total | NST |
+|---|---|---|
+| warm service tier only | 148, 149s | 80-85s |
+| + persisted assembly cache | 143, 133s | 86, 80s |
+| + post-publish DB snapshot | 110, 115s | 95, 96s |
+| + snapshot, assembly cache COLD | 105s | 91s |
+| + snapshot, assembly cache WARM | **90, 90s** | **80s** |
+
+Either one alone is worth roughly nothing:
+
+- **The assembly cache alone does nothing** (143/133s against a 148s
+  baseline — inside the noise, NST unmoved). The boot wipes and republishes
+  the test framework, so those apps get fresh `Runtime Package ID`s every
+  run and every cache entry keyed to them is orphaned. This is the same
+  effect already recorded above under "Why the post-NST publish costs what
+  it does", now measured from the other side.
+- **The snapshot alone gives 35s but hands 11s back**, because NST goes from
+  loading a stripped app set to loading 137 published apps — and compiling
+  their assemblies.
+
+Together they are 58s (39%), because the snapshot is what stops the package
+IDs churning, which is what makes the assembly cache valid, which is what
+removes the compile the snapshot just created. Do not evaluate either in
+isolation and conclude it is worthless — that is exactly what the numbers
+say if you do.
+
+The snapshot's tenant is real, not synthesized: a freshly compiled app
+(`extensions/smoke-test`) published into a snapshot-restored tenant returned
+HTTP 200 and landed in both `[Published Application]` and
+`[NAV App Installed App]`. That is the check that distinguishes this from
+the reverted "synthesize the tenant-install rows in SQL" attempt above, which
+wedged the tenant in `OperationalWithSyncPending`.
 
 ### The TestRunnerExtension app.json seed is load-bearing
 

@@ -3,10 +3,13 @@
 Replaces a ~140s cold boot with a ~25-30s restore by resuming a checkpointed
 service tier instead of starting one.
 
-**Opt-in.** Nothing changes unless you set `BC_SNAPSHOT_DIR`. With it set, a hit
-restores, a miss boots normally and leaves a snapshot behind for next time. A
-snapshot that cannot be used is never a build failure — the fallback is always a
-cold boot.
+**Opt-in per machine, not per pipeline.** An operator sets a machine up once and
+every pipeline that lands on it benefits; a pipeline never has to know whether
+the runner it got can do this. On a GitHub-hosted runner nothing is set up, so
+every command reports `disabled` and the caller cold-boots exactly as before.
+
+A snapshot that cannot be used is never a build failure — the fallback is always
+a cold boot.
 
 **Only worth it on a runner that keeps its disk** — self-hosted runners and dev
 boxes. See [Where this pays](#where-this-pays) before turning it on.
@@ -28,7 +31,36 @@ session state. Restore it against a different database and you get a BC that
 answers requests and is quietly wrong. They are written and read as a pair under
 one key, and **the key is the whole safety story.**
 
-## Turning it on
+## Turning a machine on
+
+Two things, both once per machine. Nothing goes in a pipeline.
+
+**1. Declare the store.** Either put `BC_SNAPSHOT_DIR` in the runner's
+environment — `actions-runner/.env` applies it to every job that runner takes —
+or simply create one of the well-known directories:
+
+```bash
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 755 /var/cache/bc-linux/snapshots
+# or: ~/.cache/bc-linux/snapshots
+```
+
+The directory existing **is** the opt-in. It is presence rather than a config
+flag because the directory has to exist and be writable for the feature to work
+at all, so anything else would be a second source of truth that can disagree
+with the first. Nothing creates it for you.
+
+**2. Install the prerequisites** below. `scripts/snapshot.sh preflight` tells you
+which are missing, and `status` tells you whether this machine is on:
+
+```
+$ scripts/snapshot.sh status
+disabled (this machine is not set up for snapshots — see docs/SNAPSHOT.md)
+```
+
+To turn a machine back off, remove the directory (or unset the variable). To
+retire the disk space as well, delete the store's contents.
+
+## Prerequisites and the run loop
 
 ```bash
 # 1. Host prerequisites (once)
@@ -41,9 +73,8 @@ make -C /tmp/criu -j"$(nproc)" && sudo make -C /tmp/criu install-criu
 echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
 sudo systemctl restart docker
 
-# 2. Every run
+# 2. Every run. No BC_SNAPSHOT_DIR here — the machine already declared it.
 export COMPOSE_FILE=docker-compose.yml:docker-compose.snapshot.yml
-export BC_SNAPSHOT_DIR=/var/cache/bc-snapshots
 export BC_ARTIFACTS_DIR=/var/cache/bc-artifacts     # must be a HOST directory
 
 scripts/snapshot.sh preflight        # is this host capable at all
@@ -248,3 +279,55 @@ scripts/test-snapshot-key.sh
 Runs in about a second, needs no docker daemon and no BC. It asserts what must
 invalidate the key and — just as importantly — what must not. Run it after
 touching any of the `_*_fp` functions in `scripts/snapshot.sh`.
+
+---
+
+## Getting jobs onto the machine that has the snapshots
+
+A snapshot only helps the runner holding it, so the pipeline has to land there.
+`bc-test-from-source.yml` and `bc-test-prebuilt.yml` take a `runs_on` input for
+that — a label, or a JSON array for multi-label matching.
+
+**GitHub Actions has no "prefer self-hosted, fall back to hosted".** `runs-on`
+takes labels, not preferences: name a label whose runners are all offline and
+the job **queues** — for up to 24 hours — and then fails. It does not fall back,
+and there is no syntax that asks it to.
+
+The only thing that works is to decide the label *before* the job starts, in a
+cheap job that always runs somewhere available, and feed the answer through
+`needs`. `.github/workflows/pick-runner.yml` is that job:
+
+```yaml
+jobs:
+  pick:
+    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/pick-runner.yml@master
+    with:
+      preferred: "self-hosted"      # or '["self-hosted","linux","bc"]'
+      fallback:  "ubuntu-latest"
+    secrets:
+      runner_token: ${{ secrets.RUNNER_READ_PAT }}   # optional — see below
+
+  test:
+    needs: pick
+    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    with:
+      runs_on: ${{ needs.pick.outputs.label }}
+      app_dirs: "app"
+```
+
+It decides one of two ways:
+
+| | how it knows | cost |
+|---|---|---|
+| `runner_token` given | asks the API which runners are online, and optionally which are idle | listing runners needs `administration: read`, which **`GITHUB_TOKEN` cannot be granted at any permission level** — it has to be a PAT or GitHub App token |
+| no token | reads the repository variable `BC_SELF_HOSTED` | no permissions at all, but it is a switch a human maintains, so it is stale exactly when it matters |
+
+**Neither is airtight, and the reason is structural:** a runner can go offline,
+or be taken by another job, in the seconds between the picker answering and the
+next job dispatching. `require_idle` narrows that window; nothing closes it,
+because deciding in advance is the only thing GitHub allows.
+
+`require_idle` is off by default on purpose. A runner that is busy still
+satisfies `runs-on` — the job simply queues behind the current one — and on a
+fleet of one that is usually better than a hosted runner, because that machine
+is the one holding the warm artifact cache and the snapshots.

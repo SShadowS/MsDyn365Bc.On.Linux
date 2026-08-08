@@ -22,6 +22,27 @@ name: BC test (prebuilt) [reusable]
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: >
+          Runner label(s) for the test job. Defaults to ubuntu-latest.
+
+          Point this at a self-hosted runner to get the warm-filesystem paths:
+          the artifact cache, the patched service-tier volume, and — where the
+          machine has been set up for it — snapshot mode, which restores a
+          checkpointed BC in ~25-30s instead of booting one in ~140s. None of
+          those need any other input; they are properties of the machine, not
+          of the pipeline (docs/SNAPSHOT.md).
+
+          GitHub has no built-in "prefer self-hosted, fall back to hosted": a
+          label naming an offline runner QUEUES rather than falling back. To get
+          fallback, compute this value in the calling workflow —
+          .github/workflows/pick-runner.yml exists for exactly that.
+
+          Accepts a plain label ("self-hosted") or a JSON array
+          ('["self-hosted","linux","bc"]') for multi-label matching.
+        required: false
+        type: string
+        default: "ubuntu-latest"
       bc_version:
         description: "BC platform version (e.g. 27.5)"
         required: false
@@ -133,7 +154,8 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # A JSON array selects multiple labels; anything else is used verbatim.
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     env:
       BC_RUNNER_IMAGE: ${{ inputs.runner_image }}

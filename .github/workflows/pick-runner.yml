@@ -1,0 +1,174 @@
+# Choose a runner label: prefer self-hosted, fall back to GitHub-hosted.
+#
+# WHY THIS EXISTS
+# ---------------
+# GitHub Actions has NO native fallback. `runs-on` takes labels, not
+# preferences: if nothing matching is online the job sits in the queue — for up
+# to 24 hours — and then fails. It does not fall back to a hosted runner, and
+# there is no syntax that asks it to.
+#
+# The only working pattern is to decide the label BEFORE the job starts, in a
+# cheap job that always runs somewhere available, and feed the answer to
+# `runs-on` through `needs`. That is all this workflow is.
+#
+#   jobs:
+#     pick:
+#       uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/pick-runner.yml@master
+#       with:
+#         preferred: "self-hosted"
+#       secrets:
+#         runner_token: ${{ secrets.RUNNER_READ_PAT }}   # optional, see below
+#
+#     test:
+#       needs: pick
+#       uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+#       with:
+#         runs_on: ${{ needs.pick.outputs.label }}
+#         app_dirs: "app"
+#
+# HOW IT DECIDES, AND WHAT EACH WAY COSTS
+# ---------------------------------------
+# 1. `runner_token` supplied → asks the API which runners are online, and (by
+#    default) which are idle. Accurate. The cost is that listing runners needs
+#    `administration: read`, which GITHUB_TOKEN CANNOT be granted at any
+#    permission level — it has to be a PAT or a GitHub App token. That is the
+#    whole reason option 2 exists.
+#
+# 2. No token → reads the repository variable BC_SELF_HOSTED. Set it to "true"
+#    while your fleet is up, unset or "false" to send everything to hosted
+#    runners. No permissions needed, but it is a switch a human maintains, so it
+#    is stale exactly when it matters (the fleet went down and nobody flipped
+#    it) — and then jobs queue instead of falling back.
+#
+# Neither is airtight: a runner can go offline, or be taken by another job, in
+# the seconds between this job answering and the next one dispatching. That
+# race is inherent to deciding in advance, which is the only thing GitHub
+# allows. `require_idle` narrows the window; it does not close it.
+name: Pick a runner (self-hosted preferred)
+
+on:
+  workflow_call:
+    inputs:
+      preferred:
+        description: >
+          Label to use when a matching self-hosted runner is available. A plain
+          label, or a JSON array for multi-label matching — whatever is passed
+          through to `runs_on` unchanged.
+        required: false
+        type: string
+        default: "self-hosted"
+      fallback:
+        description: "Label to use when it is not."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      require_idle:
+        description: >
+          Only prefer self-hosted when a matching runner is online AND not busy.
+          With this off, a single runner already running another job still wins
+          the vote and the second job queues behind it — which is usually still
+          what you want on a fleet of one, because that runner holds the warm
+          artifact cache and the snapshots. Only meaningful with runner_token.
+        required: false
+        type: boolean
+        default: false
+      scope:
+        description: "Where the runners are registered: 'repo' or 'org'."
+        required: false
+        type: string
+        default: "repo"
+      bc_linux_ref:
+        description: "Ref of MsDyn365Bc.On.Linux to take scripts/pick-runner.py from."
+        required: false
+        type: string
+        default: "master"
+    secrets:
+      runner_token:
+        description: >
+          PAT or App token with `administration: read` (repo scope) or
+          `organization_self_hosted_runners: read` (org scope). Optional —
+          without it the repository variable BC_SELF_HOSTED decides.
+        required: false
+    outputs:
+      label:
+        description: "Feed this straight into the next job's runs_on."
+        value: ${{ jobs.pick.outputs.label }}
+      self_hosted:
+        description: "'true' when a self-hosted runner was chosen."
+        value: ${{ jobs.pick.outputs.self_hosted }}
+
+permissions:
+  contents: read
+
+jobs:
+  pick:
+    # Always hosted. A picker that needed a self-hosted runner in order to
+    # decide whether a self-hosted runner exists would be the bug it is meant
+    # to prevent.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      label: ${{ steps.pick.outputs.label }}
+      self_hosted: ${{ steps.pick.outputs.self_hosted }}
+    steps:
+      # A reusable workflow's default checkout is the CALLER's repo, so the
+      # matcher has to be fetched explicitly. It is a file rather than inline
+      # Python because multi-line Python in a `run: |` block terminates the YAML
+      # block scalar — see the note at the top of scripts/pick-runner.py.
+      - uses: actions/checkout@v4
+        with:
+          repository: StefanMaron/MsDyn365Bc.On.Linux
+          ref: ${{ inputs.bc_linux_ref }}
+
+      - id: pick
+        env:
+          RUNNER_TOKEN: ${{ secrets.runner_token }}
+          BC_SELF_HOSTED: ${{ vars.BC_SELF_HOSTED }}
+          PREFERRED: ${{ inputs.preferred }}
+          FALLBACK: ${{ inputs.fallback }}
+          REQUIRE_IDLE: ${{ inputs.require_idle }}
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          set -uo pipefail
+          use_self=false; why=""
+
+          if [ -n "${RUNNER_TOKEN:-}" ]; then
+            if [ "$SCOPE" = "org" ]; then
+              URL="https://api.github.com/orgs/${GITHUB_REPOSITORY%%/*}/actions/runners?per_page=100"
+            else
+              URL="https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runners?per_page=100"
+            fi
+            CODE=$(curl -s -o /tmp/runners.json -w '%{http_code}' -H "Authorization: Bearer $RUNNER_TOKEN" \
+                     -H "Accept: application/vnd.github+json" "$URL")
+            if [ "$CODE" = "200" ]; then
+              IDLE_FLAG=""
+              [ "$REQUIRE_IDLE" = "true" ] && IDLE_FLAG="--require-idle"
+              # Exit status IS the answer; the line it prints is the reason.
+              if why=$(python3 scripts/pick-runner.py --labels "$PREFERRED" $IDLE_FLAG < /tmp/runners.json); then
+                use_self=true
+              fi
+              why=${why#* }   # drop the leading count, keep the prose
+            else
+              # 403 here is the common case and it is NOT a runner problem: the
+              # token lacks administration:read, or a GITHUB_TOKEN was passed.
+              why="API returned HTTP $CODE listing $SCOPE runners — check the token's administration:read scope"
+            fi
+          else
+            case "${BC_SELF_HOSTED:-}" in
+              true|True|TRUE|1|yes) use_self=true; why="repository variable BC_SELF_HOSTED is set" ;;
+              *) why="no runner_token and BC_SELF_HOSTED is not set" ;;
+            esac
+          fi
+
+          if [ "$use_self" = true ]; then LABEL="$PREFERRED"; else LABEL="$FALLBACK"; fi
+          echo "label=$LABEL"           >> "$GITHUB_OUTPUT"
+          echo "self_hosted=$use_self"  >> "$GITHUB_OUTPUT"
+          echo "chose '$LABEL' — $why"
+          {
+            echo "### Runner"
+            echo
+            echo "Chose \`$LABEL\` — $why."
+            [ "$use_self" = false ] && [ -n "${RUNNER_TOKEN:-}" ] \
+              && echo "\\nFalling back to a hosted runner means no warm artifact cache and no snapshot restore, so expect a full cold boot."
+            true
+          } >> "$GITHUB_STEP_SUMMARY"

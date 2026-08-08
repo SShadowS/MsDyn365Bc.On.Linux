@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Boot BC from a CRIU checkpoint instead of starting the service tier.
 #
-# OPT-IN. Everything here is inert unless BC_SNAPSHOT_DIR is set. With it set,
-# a hit replaces a ~140s cold boot with a ~25-30s restore; a miss boots normally
-# and leaves a snapshot behind for next time.
+# OPT-IN PER MACHINE. Inert unless the operator has set this machine up (see
+# "opt-in is a property of the MACHINE" below); no pipeline change enables or
+# disables it. Where it is on, a hit replaces a ~140s cold boot with a ~25-30s
+# restore, and a miss boots normally and leaves a snapshot behind for next time.
 #
 # WHAT A SNAPSHOT IS
 # ------------------
@@ -44,6 +45,40 @@ STAMP_NAME=".bc-snapshot-stamp"
 
 log()  { echo "[snapshot] $*" >&2; }
 die()  { echo "[snapshot] ERROR: $*" >&2; exit 1; }
+
+# ─── opt-in is a property of the MACHINE, not of the pipeline ─────────────────
+#
+# A pipeline should not have to know whether the runner it landed on can do
+# this. The operator sets a machine up once and every pipeline that runs there
+# benefits; on a GitHub-hosted runner nothing is set up, so every command here
+# turns into "disabled" and the caller cold-boots exactly as before.
+#
+# Two ways to enable a machine, checked in order:
+#
+#   1. BC_SNAPSHOT_DIR in the environment. On an Actions runner put it in
+#      actions-runner/.env, which applies to every job the runner takes.
+#   2. One of the well-known directories below EXISTS. Creating it is the
+#      opt-in:  sudo install -d -o "$(id -u)" -m 755 /var/cache/bc-linux/snapshots
+#
+# Presence rather than a config flag, because the directory has to exist and be
+# writable for the feature to work at all — so anything else would be a second
+# source of truth that can disagree with the first.
+SNAPSHOT_DIR_DEFAULTS="/var/cache/bc-linux/snapshots ${HOME:-/root}/.cache/bc-linux/snapshots"
+
+_resolve_store_root() {
+  if [ -n "${BC_SNAPSHOT_DIR:-}" ]; then
+    mkdir -p "$BC_SNAPSHOT_DIR" 2>/dev/null || return 1
+    [ -w "$BC_SNAPSHOT_DIR" ] || return 1
+    echo "$BC_SNAPSHOT_DIR"; return 0
+  fi
+  local d
+  for d in $SNAPSHOT_DIR_DEFAULTS; do
+    # Deliberately NOT created here: an existing directory is the operator's
+    # opt-in, and creating it would opt every machine in silently.
+    [ -d "$d" ] && [ -w "$d" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
 
 # ─── key ──────────────────────────────────────────────────────────────────────
 #
@@ -177,9 +212,9 @@ snapshot_key() {
 }
 
 _store() {
-  [ -n "${BC_SNAPSHOT_DIR:-}" ] || return 1
+  local root; root=$(_resolve_store_root) || return 1
   local k; k=$(snapshot_key) || return 1
-  echo "${BC_SNAPSHOT_DIR%/}/$k"
+  echo "${root%/}/$k"
 }
 
 # ─── preflight ────────────────────────────────────────────────────────────────
@@ -224,7 +259,34 @@ _apply_sysctls() {
   sudo mkdir -p /tmp/criu-work && sudo chmod 777 /tmp/criu-work
 }
 
-_sqlcmd() { docker compose exec -T sql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "${SA_PASSWORD:-Passw0rd123!}" -C -No "$@"; }
+# -b is load-bearing: WITHOUT it sqlcmd exits 0 even when the T-SQL fails. The
+# first end-to-end run had BACKUP DATABASE fail on a permission error, return
+# success, and the problem only surfaced two lines later as "cp: cannot stat".
+# A silently-failed RESTORE would have been far worse than a noisy one.
+_sqlcmd() { docker compose exec -T sql /opt/mssql-tools18/bin/sqlcmd -b -S localhost -U sa -P "${SA_PASSWORD:-Passw0rd123!}" -C -No "$@"; }
+
+# The bind-mount source docker creates for /sqlsnap is owned by root and mode
+# 755, and SQL Server runs as uid 10001 — so BACKUP TO DISK lands on EACCES
+# unless the directory is prepared first. Same reasoning as the chmod 644 on the
+# staged ISV license (CLAUDE.md).
+# Armed by create() the moment the checkpoint stops bc. Anything that fails from
+# there on would otherwise leave the caller with no BC at all, plus a
+# half-written snapshot that the next run would treat as a hit.
+_create_failed() {
+  local rc=$?
+  trap - EXIT
+  [ "$rc" -eq 0 ] && return 0
+  log "create failed — discarding the partial snapshot and bringing bc back"
+  [ -n "${CREATE_STORE:-}" ] && rm -rf "${CREATE_STORE:?}"
+  docker compose up -d --wait >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+_prepare_sqldir() {
+  local d="${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}"
+  mkdir -p "$d" 2>/dev/null || sudo mkdir -p "$d"
+  chmod 777 "$d" 2>/dev/null || sudo chmod 777 "$d"
+}
 
 _bc_odata() {
   docker compose exec -T bc curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
@@ -233,7 +295,11 @@ _bc_odata() {
 
 # ─── status ───────────────────────────────────────────────────────────────────
 status() {
-  if [ -z "${BC_SNAPSHOT_DIR:-}" ]; then echo "disabled"; return 1; fi
+  local root
+  if ! root=$(_resolve_store_root); then
+    echo "disabled (this machine is not set up for snapshots — see docs/SNAPSHOT.md)"
+    return 1
+  fi
   local s
   # A key that cannot be computed is a miss, not an error: the caller's next
   # move is a cold boot either way, and snapshot mode must never be the reason
@@ -253,7 +319,7 @@ status() {
 # Call this against a BC that is healthy and has NOT yet had the consumer's own
 # apps published — the point of the boot where the state is still generic.
 create() {
-  [ -n "${BC_SNAPSHOT_DIR:-}" ] || die "BC_SNAPSHOT_DIR is not set"
+  _resolve_store_root >/dev/null || die "this machine is not set up for snapshots — see docs/SNAPSHOT.md"
   preflight || die "host cannot checkpoint (see above)"
   _apply_sysctls
   local s cid t0
@@ -263,6 +329,11 @@ create() {
   [ "$(_bc_odata)" = "200" ] || die "bc is not serving OData — refusing to snapshot a BC that is not healthy"
 
   rm -rf "$s"; mkdir -p "$s/checkpoint"
+  CREATE_STORE="$s"
+  # From the checkpoint onwards bc is STOPPED, so every later failure has to put
+  # it back. Without this a backup error leaves the caller with no BC at all and
+  # a half-written snapshot that would be picked up as a hit next run.
+  trap _create_failed EXIT
   t0=$(date +%s)
   # --leave-running=false: the process must really stop, otherwise the backup
   # below races a BC that is still writing and the two halves disagree.
@@ -272,9 +343,12 @@ create() {
   log "checkpoint written in $(( $(date +%s) - t0 ))s"
 
   # AFTER the checkpoint, so the database matches the frozen process exactly.
-  local bak_in_sql="/sqlsnap/cronus.bak"
-  _sqlcmd -Q "BACKUP DATABASE [CRONUS] TO DISK='$bak_in_sql' WITH COPY_ONLY, INIT, COMPRESSION" >/dev/null
-  cp "${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}/cronus.bak" "$s/cronus.bak"
+  _prepare_sqldir
+  _sqlcmd -Q "BACKUP DATABASE [CRONUS] TO DISK='/sqlsnap/cronus.bak' WITH COPY_ONLY, INIT, COMPRESSION" >/dev/null
+  # Streamed out through the container rather than copied on the host: SQL
+  # writes the backup as uid 10001 mode 640, which the runner user cannot read.
+  docker compose exec -T sql cat /sqlsnap/cronus.bak > "$s/cronus.bak"
+  [ -s "$s/cronus.bak" ] || die "database backup came out empty"
 
   # Written last: the stamp is what makes the pair readable, so it must not
   # exist until both halves are on disk. A torn snapshot is a miss, not a
@@ -296,6 +370,7 @@ create() {
     log "could not resume from the fresh checkpoint — cold booting so the caller is not left without a BC"
     docker compose up -d --wait
   fi
+  trap - EXIT
 }
 
 # The healthcheck tests for /tmp/bc-ready, which the entrypoint writes — and the
@@ -316,7 +391,6 @@ _service_volume_stamp() {
 
 # ─── restore ──────────────────────────────────────────────────────────────────
 restore() {
-  [ -n "${BC_SNAPSHOT_DIR:-}" ] || die "BC_SNAPSHOT_DIR is not set"
   local s; s=$(_store) || die "cannot compute a snapshot key (run: scripts/snapshot.sh key)"
   status >/dev/null || { log "no snapshot for this key — cold boot"; log "  key: $s"; return 1; }
   preflight || { log "host cannot restore — cold boot"; return 1; }
@@ -338,8 +412,9 @@ restore() {
   # SQL first: the restored NST wakes holding a connection pool whose peer is
   # gone, and reconnects on first use — but only if there is something to
   # reconnect TO, with the database it expects.
-  mkdir -p "${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}" && chmod 777 "${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}"
+  _prepare_sqldir
   cp "$s/cronus.bak" "${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}/cronus.bak"
+  chmod 644 "${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}/cronus.bak"
   docker compose up -d sql
   local i
   for i in $(seq 1 90); do
@@ -408,7 +483,7 @@ case "${1:-}" in
   create)    create ;;
   restore)   restore ;;
   *) cat >&2 <<USAGE
-usage: BC_SNAPSHOT_DIR=<dir> scripts/snapshot.sh <command>
+usage: scripts/snapshot.sh <command>
 
   key        print the key and every component of it
   status     hit / miss / disabled for the current key
@@ -416,7 +491,11 @@ usage: BC_SNAPSHOT_DIR=<dir> scripts/snapshot.sh <command>
   create     checkpoint a healthy BC + back up its database into the store
   restore    bring BC up from the store; non-zero means "cold boot instead"
 
-Opt-in: with BC_SNAPSHOT_DIR unset every command except key/preflight is inert.
+Opt-in per MACHINE, not per pipeline: enabled when BC_SNAPSHOT_DIR is set or one
+of these directories exists and is writable --
+  /var/cache/bc-linux/snapshots
+  $HOME/.cache/bc-linux/snapshots
+Otherwise every command reports "disabled" and the caller should cold-boot.
 See docs/SNAPSHOT.md.
 USAGE
      exit 2 ;;

@@ -20,7 +20,12 @@ name: Benchmark snapshot mode (self-hosted)
 on:
   push:
     branches: [claude/hosted-runner-performance-42ljw4]
-    paths: ['.github/workflows/bench-selfhosted.yml']
+    paths:
+      - '.github/workflows/bench-selfhosted.yml'
+      # A fix to the run path should re-measure without needing this file
+      # touched as well.
+      - 'scripts/snapshot.sh'
+      - 'scripts/bench-snapshot.sh'
   workflow_dispatch:
 
 permissions:

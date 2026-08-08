@@ -327,11 +327,24 @@ _create_failed() {
 
 _prepare_sqldir() {
   local d="${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}"
-  # Created by US, before docker ever mounts it. The sudo fallbacks that used to
-  # be here existed only because docker had already auto-created the bind-mount
-  # source as root — a problem caused by creating it too late, not one needing
-  # privilege.
-  mkdir -p "$d" && chmod 777 "$d" || die "cannot prepare $d"
+  # SQL Server writes the backup here as uid 10001, so it has to be
+  # world-writable. Creating it ourselves before docker ever mounts it is the
+  # normal path; but a directory left root-owned by an earlier run (docker
+  # auto-creates a missing bind-mount source as root) cannot be chmod'd by us.
+  # Repair it through the docker socket rather than reaching for sudo — same
+  # authority the checkpoint copies use.
+  local base; base=$(basename "$d")
+  mkdir -p "$d" 2>/dev/null || true
+  chmod 777 "$d" 2>/dev/null || true
+  if [ ! -d "$d" ] || [ ! -w "$d" ] || ! stat -c '%a' "$d" 2>/dev/null | grep -q '7$'; then
+    [ -n "$base" ] && [ "$base" != "." ] && [ "$base" != "/" ] \
+      || die "refusing to repair a suspicious staging path: $d"
+    log "repairing $d (owner $(stat -c %U "$d" 2>/dev/null || echo unknown)) via the docker socket"
+    docker run --rm -v "$(dirname "$d")":/p --entrypoint sh "$(_bc_image_ref)" -c \
+      "rm -rf '/p/$base' && mkdir -p '/p/$base' && chmod 777 '/p/$base' && chown $(id -u):$(id -g) '/p/$base'" \
+      >/dev/null 2>&1 || true
+  fi
+  [ -w "$d" ] || die "cannot write $d — remove it and retry: sudo rm -rf $d"
   # SQL Server wrote the previous backup as uid 10001 mode 640. cp TRUNCATES an
   # existing file, which needs write permission on the FILE — a 777 directory
   # does not help. Remove it first; unlink only needs the directory.

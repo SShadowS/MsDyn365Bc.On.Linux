@@ -199,10 +199,27 @@ What is still open, in the order it matters:
 1. **A fresh SQL container.** Run 16 restored against the same live SQL
    container throughout. `tcp-close` means criu closes the pooled connections
    rather than repairing them, so what actually has to hold is that ADO.NET
-   reconnects on first use — but that was never put under stress. The probe now
-   restarts sql between checkpoint and restore (`RESTART_SQL_BEFORE_RESTORE`).
-   A genuinely fresh container additionally needs the database restored into it,
-   which is the entrypoint's job and does not run on a resumed process.
+   reconnects on first use — never put under stress.
+
+   **Run 17 tried `docker compose restart sql` and the result is void.**
+   `/var/opt/mssql/data` is a **tmpfs**, and a tmpfs is re-created every time a
+   container starts — so the restart wiped the whole instance, `master`
+   included. BC restored and then reported *"Cannot establish a connection to
+   the SQL Server/Database … The database does not exist"*, OData 400, publish
+   422. That is a measurement of deleting the database, not of replacing the
+   peer. **Do not restart the sql container expecting its data to survive.**
+
+   The probe now does the honest version (`FRESH_SQL_BEFORE_RESTORE`): back the
+   database up *after* the checkpoint, when BC is frozen and the two are
+   consistent; `docker compose rm -sf sql` and bring up a new container; assert
+   the new instance really has no CRONUS; recreate the BC login (it lived in the
+   wiped `master`) and restore the backup; then restore BC. The backup goes to a
+   host bind mount, because `RESTORE FROM DISK` reads SQL Server's filesystem —
+   the same constraint as the OPENROWSET license import in CLAUDE.md.
+
+   That shape is also the answer to "what would production look like": a BC
+   checkpoint is only usable together with a snapshot of the database it was
+   booted against. Neither half is independently restorable.
 2. **Moving the payload.** 2.1 GB per checkpoint. On a self-hosted runner it
    sits on disk and costs nothing. Through GitHub's cache it is the artifact
    caching ban all over again (CLAUDE.md) — 10 GB repo cap, upload every run —

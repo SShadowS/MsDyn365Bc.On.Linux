@@ -13,11 +13,13 @@
 # the wall-clock win, which only exists on a runner that keeps the checkpoint
 # between jobs. It tests the prerequisite: does BC come back alive at all.
 #
-# It also tests the EASY variant. Restore happens in the same job against the
-# SAME still-running SQL container, so the ~17 pooled TCP connections have a
-# live peer with matching sequence numbers. The case that actually matters —
-# restoring against a FRESH SQL container in a later job — is strictly harder.
-# A pass here is necessary, not sufficient. A failure here ends the design.
+# Run 16 answered the prerequisite: yes. 127s of cold boot became a 30s restore,
+# and a newly compiled app still published afterwards. What it did NOT test is
+# the SQL side — restore there had the same live SQL container throughout.
+# So the probe now replaces sql with a fresh container and restores a database
+# backup into it between checkpoint and restore, which is the shape a later CI
+# job actually has. The remaining gap to production is only that the checkpoint
+# and the backup do not yet cross a job boundary.
 #
 # It is a full BC boot plus a checkpoint cycle — several minutes of runner
 # time — so it is triggered narrowly: see the `on:` block below.
@@ -122,11 +124,12 @@ jobs:
       # rather than deleted, but off -- do not perturb a working configuration.
       RSEQ_OFF: "false"
       # THE question run 16 leaves open. Restore there had the same SQL container
-      # alive the whole time, so BC's ~17 pooled connections had a live peer.
-      # This severs them: sql is restarted between checkpoint and restore, so the
-      # restored NST wakes up holding handles to sockets whose peer is gone. That
-      # is the case CI actually needs, and it is strictly harder.
-      RESTART_SQL_BEFORE_RESTORE: "true"
+      # alive the whole time, so BC's ~17 pooled connections had a live peer and
+      # the database was never anywhere else. This replaces sql with a new
+      # container and restores a backup into it, which is what a later CI job
+      # actually has. See the step for why `docker compose restart sql` (run 17)
+      # was not this and could never have been.
+      FRESH_SQL_BEFORE_RESTORE: "true"
 
     steps:
       - uses: actions/checkout@v4
@@ -363,8 +366,16 @@ jobs:
           echo "GLIBC_TUNABLES for bc: '${V:-<unset>}'"
           # COMPOSE_FILE means every later bare `docker compose` picks this up
           # without touching the steps themselves.
+          # RESTORE FROM DISK reads SQL Server's filesystem, so the backup has to
+          # live somewhere that outlives the sql container -- same constraint as
+          # the OPENROWSET license import (see CLAUDE.md). 777 because mssql runs
+          # as uid 10001 inside the container.
+          mkdir -p /tmp/sqlsnap && chmod 777 /tmp/sqlsnap
           cat > override-host.yml <<'YAML'
           services:
+            sql:
+              volumes:
+                - /tmp/sqlsnap:/sqlsnap
             bc:
               network_mode: host
               environment:
@@ -513,29 +524,68 @@ jobs:
             || echo "(checkpoint dir not located — size unknown)"
 
       # Run 16 restored BC against the SAME live SQL container, which is the easy
-      # case and was never the interesting one: `tcp-close` in runc.conf means
-      # criu closes the pooled connections instead of repairing them, so what is
-      # actually being tested is whether ADO.NET reconnects on first use after
-      # resume. Restarting sql here makes that real -- new sockets, new peer,
-      # same data (the tmpfs survives a restart because the container is not
-      # recreated). A fully fresh sql container additionally needs the database
-      # restored into it, which is the entrypoint's job and does not run on a
-      # resumed process; that is a separate experiment.
-      - name: Restart SQL so the restored BC has no live peer
-        id: sqlrestart
-        if: ${{ steps.checkpoint.outcome == 'success' && env.RESTART_SQL_BEFORE_RESTORE == 'true' }}
+      # case. This replaces sql with a genuinely new container between checkpoint
+      # and restore, which is what a later CI job would actually have.
+      #
+      # Run 17 tried to do this with `docker compose restart sql` and was
+      # WRONG: /var/opt/mssql/data is a tmpfs, and a tmpfs is re-created every
+      # time a container starts -- so the restart wiped the database, master
+      # included. BC came back to "The database does not exist", OData 400. That
+      # measured nothing about checkpoint/restore.
+      #
+      # So the database has to be carried across explicitly, which is also the
+      # honest shape of the real design: a checkpoint of BC is only usable
+      # alongside a snapshot of the database it was booted against. Order
+      # matters -- the backup is taken AFTER the checkpoint, when BC is frozen,
+      # so the two are consistent.
+      - name: Replace SQL with a fresh container, carrying the database across
+        id: sqlfresh
+        if: ${{ steps.checkpoint.outcome == 'success' && env.FRESH_SQL_BEFORE_RESTORE == 'true' }}
         run: |
           set -e
-          docker compose restart sql
-          for i in $(seq 1 60); do
+          SA="${SA_PASSWORD:-Passw0rd123!}"
+          DBU="${BC_DB_USER:-bctest}"; DBP="${BC_DB_PASSWORD:-Test1234}"
+          # The mssql image ships sqlcmd -- its own healthcheck uses it -- so no
+          # helper container is needed on either side of the swap.
+          SQLC="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $SA -C -No"
+          OLD=$(docker compose ps -q sql)
+
+          docker compose exec -T sql $SQLC -Q "BACKUP DATABASE [CRONUS] TO DISK='/sqlsnap/cronus.bak' WITH COPY_ONLY, INIT, COMPRESSION" >/dev/null
+          ls -lh /tmp/sqlsnap/cronus.bak
+
+          docker compose rm -sf sql
+          docker compose up -d sql
+          for i in $(seq 1 90); do
             [ "$(docker compose ps --format '{{.Health}}' sql 2>/dev/null)" = healthy ] && break
             sleep 2
           done
-          H=$(docker compose ps --format '{{.Health}}' sql 2>/dev/null)
-          echo "sql health after restart: ${H:-unknown}"
-          [ "$H" = healthy ] || { echo "::error::sql did not come back — the restore result would be meaningless"; exit 1; }
-          # Falsifiable: a restart that preserved the sockets would prove nothing.
-          echo "sql container started at: $(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q sql)")"
+          NEW=$(docker compose ps -q sql)
+          echo "sql container: $OLD -> $NEW"
+          [ -n "$NEW" ] && [ "$NEW" != "$OLD" ] || { echo "::error::sql was not actually replaced"; exit 1; }
+          [ "$(docker compose ps --format '{{.Health}}' sql)" = healthy ] \
+            || { echo "::error::fresh sql never became healthy"; exit 1; }
+          # Falsifiable: the tmpfs must really be empty, or this is run 17 again
+          # with extra steps and the "fresh" container is nothing of the kind.
+          docker compose exec -T sql $SQLC -h -1 -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.databases WHERE name='CRONUS'" \
+            | tr -d ' \r' | grep -qx 0 || { echo "::error::CRONUS still present in the 'fresh' sql — tmpfs was not re-created"; exit 1; }
+          echo "confirmed: fresh sql has no CRONUS database"
+
+          # master went with the old container, so the BC login has to be
+          # recreated exactly as entrypoint.sh Step 3 makes it (sysadmin, so no
+          # per-database user mapping is needed).
+          docker compose exec -T sql $SQLC -Q "
+            CREATE LOGIN [$DBU] WITH PASSWORD = '$DBP', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;
+            ALTER SERVER ROLE sysadmin ADD MEMBER [$DBU];" >/dev/null
+          D=$(docker compose exec -T sql $SQLC -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" | head -1 | cut -f1)
+          L=$(docker compose exec -T sql $SQLC -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/sqlsnap/cronus.bak'" | head -2 | tail -1 | cut -f1)
+          echo "logical names: data='$D' log='$L'"
+          docker compose exec -T sql $SQLC -Q "
+            RESTORE DATABASE [CRONUS] FROM DISK='/sqlsnap/cronus.bak'
+            WITH MOVE '$D' TO '/var/opt/mssql/data/CRONUS.mdf',
+                 MOVE '$L' TO '/var/opt/mssql/data/CRONUS_log.ldf', REPLACE" >/dev/null
+          docker compose exec -T sql /opt/mssql-tools18/bin/sqlcmd -S localhost -U "$DBU" -P "$DBP" -d CRONUS -C -No \
+            -h -1 -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM [dbo].[Published Application]" | head -2
+          echo "database restored into the fresh sql container"
 
       - name: Restore from the checkpoint
         id: restore
@@ -654,7 +704,7 @@ jobs:
             echo "|---|---|"
             echo "| cold boot to healthy | ${{ steps.boot.outputs.cold_boot }}s |"
             echo "| checkpoint | ${{ steps.checkpoint.outcome }} (${{ steps.checkpoint.outputs.checkpoint_s }}s) |"
-            echo "| sql restarted before restore | ${{ steps.sqlrestart.outcome }} |"
+            echo "| fresh sql + db restore | ${{ steps.sqlfresh.outcome }} |"
             echo "| restore | ${{ steps.restore.outcome }} (${{ steps.restore.outputs.restore_s }}s, OData ${{ steps.restore.outputs.odata }}) |"
             echo "| post-restore health | ${{ steps.health.outcome }} |"
             echo "| novel app publish | ${{ steps.publish.outcome }} |"
@@ -671,7 +721,7 @@ jobs:
             echo "This runner is ephemeral, so these timings do NOT show the win —"
             echo "that only exists where the checkpoint survives between jobs, and"
             echo "moving a ~2.1 GB checkpoint payload there is its own problem."
-            if [ "${{ steps.sqlrestart.outcome }}" = "success" ]; then
+            if [ "${{ steps.sqlfresh.outcome }}" = "success" ]; then
               echo "SQL was restarted between checkpoint and restore, so BC resumed with"
               echo "its pooled connections' peer gone. A fully fresh SQL container also"
               echo "needs the database restored into it — still untested."

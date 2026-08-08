@@ -322,6 +322,23 @@ Three things about this are deliberate and easy to get wrong:
 `flock`s its destination, so several runners can share one
 `artifact_cache_dir` without racing.
 
+**What BC itself writes into the reused volume.** Audited by booting, then
+listing `/bc/service` files newer than the stamp: exactly one, the Reporting
+Service `.exe`. The entrypoint swaps it for a sleep stub *after* the dev
+endpoint answers, because NST's startup probes the real PE's assembly
+metadata — so on a warm volume the next boot handed that probe a `/bin/sh`
+script, with the real binary parked in `.win`. It survives (BC 28.1 boots and
+serves), but a warm boot was not doing what a cold boot does, and nothing
+said so. The entrypoint now restores `.win` at the top, next to the
+runtime-DLL `.bak` restore, which also fixes the same bug on a plain
+container restart. If you add anything else that rewrites the service dir
+after NST is up, it needs the same treatment.
+
+The R2R assembly cache is **not** in a volume — it lives under
+`/usr/share/Microsoft/Microsoft Dynamics NAV/<nav>/Server` in the container
+filesystem (1.2 GB on BC 28.1), so it is rebuilt and re-seeded every boot.
+No leak, and no reuse either; moving it into a volume is unexplored.
+
 ### The TestRunnerExtension app.json seed is load-bearing
 
 `resolve-keep-app-ids.py` **auto-seeds itself** with

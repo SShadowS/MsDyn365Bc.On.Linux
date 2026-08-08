@@ -41,6 +41,20 @@ SQL_SERVER="${SQL_SERVER:-sql}"
 ARTIFACTS="/bc/artifacts"
 SERVICE_DIR="/bc/service"
 
+# Same shape as the .bak restore above, for the one file BC's own boot rewrites
+# inside the volume. The Reporting Service .exe is swapped for a sleep stub
+# AFTER the dev endpoint answers, because NST's startup probes the real PE's
+# assembly metadata and has to find it there. `/bc/service` outlives the
+# container, so without this the next boot hands that probe a /bin/sh script
+# instead — it happens to survive, but a warm boot then differs from a cold one
+# in a way nothing reports. Restoring here makes the post-start swap re-run
+# every boot, which is what the swap's own `[ ! -f .win ]` guard assumes.
+REPORT_EXE_AT_BOOT="$SERVICE_DIR/SideServices/Microsoft.BusinessCentral.Reporting.Service.exe"
+if [ -f "${REPORT_EXE_AT_BOOT}.win" ]; then
+    mv -f "${REPORT_EXE_AT_BOOT}.win" "$REPORT_EXE_AT_BOOT"
+    echo "[entrypoint] Restored the real Reporting Service .exe (stub is re-applied once NST is up)"
+fi
+
 # =============================================================================
 # Step 1: Download artifacts if not already present
 # =============================================================================

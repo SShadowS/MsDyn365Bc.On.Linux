@@ -79,9 +79,11 @@ jobs:
       # boot check alone is not evidence (see Patch #30).
       VERIFY_PUBLISH: ${{ github.event_name != 'workflow_dispatch' && 'true' || inputs.verify_publish }}
       BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache
-      # Only used if criu is not installable from apt (it was not on
-      # ubuntu-24.04 in run 1). Pinned so a source build is reproducible.
-      CRIU_REF: v4.0
+      # criu is not in apt on ubuntu-24.04, so it gets built from source.
+      # "latest" resolves the newest release ON THE RUNNER: pinning v4.0 is what
+      # produced run 5's failure, since that release predates this kernel.
+      # Set an explicit tag (e.g. v4.0) to reproduce an older result.
+      CRIU_REF: latest
 
     steps:
       - uses: actions/checkout@v4
@@ -121,7 +123,13 @@ jobs:
               libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
               python3-protobuf libnl-3-dev libnet-dev libcap-dev libbsd-dev \
               libgnutls28-dev libnftables-dev iproute2 asciidoc xmlto
-            git clone --depth 1 --branch "$CRIU_REF" https://github.com/checkpoint-restore/criu.git /tmp/criu
+            REF="$CRIU_REF"
+            if [ "$REF" = "latest" ]; then
+              REF=$(curl -fsSL https://api.github.com/repos/checkpoint-restore/criu/releases/latest \
+                    | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo v4.0)
+              echo "resolved newest criu release: $REF"
+            fi
+            git clone --depth 1 --branch "$REF" https://github.com/checkpoint-restore/criu.git /tmp/criu
             make -C /tmp/criu -j"$(nproc)" 2>&1 | tail -15
             sudo make -C /tmp/criu install-criu
             command -v criu || sudo ln -sf /usr/local/sbin/criu /usr/sbin/criu
@@ -130,9 +138,23 @@ jobs:
           # BC that had never been checkpointed.
           command -v criu >/dev/null || { echo "::error::criu unavailable — probe cannot mean anything"; exit 1; }
           criu --version || sudo criu --version
-          echo "--- criu check --all (informational; some features are optional) ---"
-          sudo criu check --all
-          echo "criu check exit: $?"
+          echo "--- criu check ---"
+          # NOT informational. Run 5 printed exit 1 here (vDSO/kerndat init
+          # failure on kernel 6.17) and the probe went on to boot BC for two
+          # minutes before failing at the checkpoint for that same reason.
+          if ! sudo criu check 2>&1 | tee criu-check.out; then :; fi
+          if grep -qE 'kerndat|vdso|Could not initialize kernel features' criu-check.out; then
+            {
+              echo "### criu cannot initialise on this kernel"
+              echo '```'; tail -12 criu-check.out; echo '```'
+              echo "kernel: \`$(uname -r)\`, criu: \`$(criu --version 2>&1 | head -1)\`"
+              echo
+              echo "This is a criu/kernel incompatibility on the runner image, **not**"
+              echo "a finding about Business Central. Nothing was checkpointed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::criu cannot initialise on kernel $(uname -r) — probe cannot proceed"
+            exit 1
+          fi
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
       # ── Gate 2: docker checkpoint needs the experimental daemon flag ──────
@@ -214,7 +236,11 @@ jobs:
               echo '```'
               echo "criu on PATH: \`$(command -v criu || echo NONE)\`"
             } >> "$GITHUB_STEP_SUMMARY"
-            if grep -qiE "tcp|socket|established" checkpoint.err ./criu-dump.log 2>/dev/null; then
+            # Must match criu's ACTUAL tcp refusal, not the word "socket".
+            # Run 5 matched `sockets: Probing sock diag modules` -- a routine
+            # startup line -- and reported a TCP refusal that never happened,
+            # while the real cause (vDSO) went unnamed.
+            if grep -qiE "established tcp|tcp-established|Connected TCP socket|socket is in TCP_" checkpoint.err ./criu-dump.log 2>/dev/null; then
               echo "::warning::checkpoint refused on established TCP connections — expected; retry via raw criu --tcp-established"
               echo "classification=tcp-sockets" >> "$GITHUB_OUTPUT"
             else

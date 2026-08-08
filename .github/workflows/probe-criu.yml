@@ -208,6 +208,15 @@ jobs:
               network_mode: host
               environment:
                 SQL_SERVER: localhost
+                # Run 14 restored the mappings (ENOMEM gone once overcommit was
+                # relaxed) and then segfaulted on resume. .NET 8 defaults W^X ON,
+                # which double-maps executable memory -- one RW view and one RX
+                # view over the same memfd. That pairing is a known CRIU sore
+                # point: restore them wrongly and the first instruction fetched
+                # is garbage, which is exactly a SIGSEGV on resume with no
+                # managed frames. Turning it off costs a little JIT throughput
+                # and nothing else.
+                DOTNET_EnableWriteXorExecute: "0"
           YAML
           echo "COMPOSE_FILE=docker-compose.yml:override-host.yml" >> "$GITHUB_ENV"
           # bridge DNS ("sql") is gone with host networking, so BC reaches SQL on

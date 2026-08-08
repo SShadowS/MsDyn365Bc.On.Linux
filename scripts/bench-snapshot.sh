@@ -99,7 +99,11 @@ run_rung() {  # run_rung <name> <fn>
     printf '  iteration %d: %ss\n' "$i" "$r"
     # The phase breakdown is in this output, and so is the explanation of a
     # failure. Both were being discarded.
-    grep -aE '\[snapshot\] (sql up|checkpoint staged|criu restore|restored and serving)' "$lg" \
+    # Anchored right after "[snapshot] ", so it must match how the lines
+    # actually start. "sql up" matched nothing: that phase logs as "database
+    # restored (sql up + login + restore: Ns)", so the two phases that bracket
+    # criu were silently missing from run 17's breakdown.
+    grep -aE '\[snapshot\] (database restored|checkpoint staged|criu restore|bc answered|restored and serving)' "$lg" \
       | sed 's/^/      /' || true
     if [ "$r" = FAIL ]; then
       echo "      ---- why it failed (last 15 lines) ----"

@@ -852,6 +852,9 @@ restore() {
     return 1
   fi
   _mark_ready
+  # `docker start --checkpoint` stages too, and run 17 ended with one directory
+  # still in the tmpfs. Reaping only around create leaks ~2.1 GB per restore.
+  _reap_ctrd_staging
   log "bc answered OData $(( $(date +%s) - t_criu ))s after the restore returned"
   log "restored and serving in $(( $(date +%s) - t0 ))s"
 }

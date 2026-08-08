@@ -375,14 +375,39 @@ hardware**, because the ratio depends on it far more than expected.
 
 ### A real machine — Ryzen 5 5600X, 12 threads, 31 GB, btrfs, kernel 7.1.4
 
+Bench run 17, n=3 per rung, every iteration succeeding:
+
 | rung | median | min-max |
 |---|---|---|
-| warm (volumes kept, no snapshot) | **70s** | 68-71 |
-| restore (snapshot mode) | **50s** | 50-51 |
-| checkpoint create | 21s | — |
+| warm (volumes kept, no snapshot) | **73s** | 71-74 |
+| restore (snapshot mode) | **61s** | 61-61 |
+| checkpoint create | 34s | — |
 
-**20s saved, 1.4x.** Not the 3x the hosted runners suggested, and the reason is
-the baseline: this box boots BC in 70s, so there is far less startup to skip.
+**12s saved, 1.2x.** Not the 2.8x the hosted runners suggested, and the reason
+is the baseline: this box boots BC in 73s, so there is far less startup to skip.
+
+Both rungs include a `docker compose down`, so they are comparable; the restore
+itself, measured from inside `snapshot.sh`, is **37s** of that 61s.
+
+#### Where the 37s goes
+
+| phase | time |
+|---|---|
+| sql up + BC login + `RESTORE DATABASE` | ~9s |
+| staging the checkpoint into the new container | **1s** |
+| `docker start --checkpoint` (criu maps the process back) | **27s** |
+| BC serving OData after criu returned | ~0s |
+
+Three things follow, and they are the useful part of this whole exercise:
+
+- **criu is 73% of it.** Attacking SQL or the copy cannot move the total much.
+- **The copy is already free.** `btrfs filesystem du` on the store reports
+  `Total 3.54GiB, Exclusive 0.00B, Set shared 2.38GiB` — every extent is
+  shared, so `--reflink=auto` is doing exactly what it was added for. An
+  earlier reading that said otherwise used `du`, which cannot see sharing.
+- **BC is ready the instant criu returns.** There is no post-restore warm-up to
+  optimise away; the restored NST reconnects to the fresh SQL container on
+  first use, as intended.
 
 ### A GitHub-hosted runner — 4 vCPU
 
@@ -395,21 +420,20 @@ the baseline: this box boots BC in 70s, so there is far less startup to skip.
 
 ### What that comparison actually shows
 
-Look at the restores: **47s hosted, 50s on a machine that is nearly twice as
-fast at everything else.** The restore barely moved. So it is dominated by costs
-that do not shrink with CPU — starting SQL, restoring a 539 MB backup, copying a
-2.1 GB checkpoint, and criu mapping it back in — while the cold boot it replaces
-*is* CPU-bound and nearly halves on better hardware.
+Look at the restores: **47s hosted, 37s on a machine that is nearly twice as
+fast at everything else.** The restore barely moved, while the boot it replaces
+nearly halved. That is because the restore is dominated by criu mapping a
+263 GB-VmSize process back in — page-table work that a faster CPU does not make
+proportionally cheaper — whereas a cold boot is CPU-bound JIT and AL compilation
+that does scale.
 
 The practical consequence: **the faster your machine, the smaller the win.**
 A slow 2-vCPU CI box has the most to gain; a fast workstation the least. Do not
-quote 2.8x for a machine like the one above.
+quote 2.8x for a machine like the one above, and do not quote 1.2x for CI.
 
-That also means the 50s is the number worth attacking, and it has not been
-broken down yet — `snapshot.sh restore` now logs its three phases separately
-(sql + database, checkpoint staging, criu + readiness) so the next run says
-where it goes. If SQL and the database restore turn out to be a third of it,
-keeping the sql container up between jobs recovers that directly.
+It also means the remaining time is in the one phase hardest to attack. Keeping
+the sql container up between jobs would recover ~9s of the 37s; nothing
+available recovers much of criu's 27s.
 
 ### Not reproducible on Windows
 

@@ -334,6 +334,48 @@ runtime-DLL `.bak` restore, which also fixes the same bug on a plain
 container restart. If you add anything else that rewrites the service dir
 after NST is up, it needs the same treatment.
 
+### `/bc/patched` is empty, so every patch guarded on it is inert (found 2026-08-08, NOT fixed)
+
+Found while measuring NST restarts. Verified, not inferred:
+
+- `src/Dockerfile` only `mkdir`s `/bc/patched`. `docker run --rm <image> ls
+  /bc/patched` returns **0 entries**.
+- Nothing writes to it at runtime. `grep -rn 'bc/patched'` across `scripts/`
+  and `src/tools/` matches only the entrypoint's own reads.
+- `MergeNetstandard` writes to a **different directory**:
+  `src/tools/MergeNetstandard/Program.cs:12` is
+  `PatchedDir = Path.Combine(BaseDir, "StartupHook/patched")`, so with the
+  entrypoint's `BASE_DIR=/bc` its output lands in `/bc/StartupHook/patched`
+  (confirmed: 3 files there, `/bc/patched` still empty afterwards).
+
+Two consequences:
+
+1. **The merge re-runs on every boot** (2-3s). Its guard is
+   `[ ! -f /bc/patched/netstandard-merged.dll ]`, at a path the producer never
+   writes to, so it can never be satisfied.
+2. **Every `[ -f /bc/patched/... ]` copy in Step 2b is skipped** — Patch #14's
+   `CodeAnalysis.dll` type-forwarding fix, the `Mono.Cecil.dll` CheckFileName
+   fix, the Layer 2 `refasm-forwarding` assemblies, and the Layer 3 merged
+   assemblies deployed into Add-Ins. The `PatchNclTestPage` patches are
+   unaffected — those log "Patched Nav.Ncl.dll" and genuinely run.
+
+The merge is also partly broken on its own terms: it prints
+`SKIP: netstandard-merged.dll not found`, so the netstandard merge — the one
+Layer 3 is mostly about — is not produced at all.
+
+**Deliberately not fixed here.** Repointing the paths would activate compiler
+patches that have evidently been inert, and Patch #14 and the Cecil fix change
+how the server-side AL compiler resolves type forwards. Turning them back on
+is a behavioural change whose blast radius is AL compilation, and the
+validation that matters for that lives in `PipelinePerformanceComparison`'s
+BCApps sweeps, not in a boot test. BC 28.1 boots, publishes extensions, and
+accepts a freshly compiled app with all of this inert — so whatever these
+patches were for is not exercised by that path.
+
+Whoever picks this up: decide first whether these patches are still needed at
+all. "Delete the dead guards" and "fix the paths" are both defensible; leaving
+a documented patch silently not running is not.
+
 ### The assembly cache and the DB snapshot only pay off together
 
 Measured 2026-08-08 on a 4-vCPU box, BC 28.1, five configurations, artifacts

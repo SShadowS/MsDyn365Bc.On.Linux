@@ -74,6 +74,56 @@ The corollary matters for anything else in this file: **time spent in the
 assembly cache path is not automatically removable.** Measure the end state,
 not just the phase you shortened.
 
+## 4. Process snapshot (CRIU) — measured constraints, NOT yet attempted
+
+With the caches in CLAUDE.md in place a boot is ~90s, of which ~80s is NST
+startup, and the two direct attacks on that failed (tiering: noise; Merkle
+skip: 10x worse, above). The remaining lever is to not run startup at all.
+
+Measured on a healthy BC 28.1 instance at readiness, so nobody has to
+re-derive them:
+
+| | |
+|---|---|
+| RSS | 2.24 GB |
+| **private dirty — the checkpoint payload** | **1.80 GB** |
+| threads | 40 |
+| open fds | 838 |
+| **established sockets to SQL** | **17** |
+
+What those numbers imply:
+
+- **Self-hosted only.** Restoring 1.8 GB from local disk is single-digit
+  seconds against 80s of startup. On a GitHub-hosted runner you would
+  *download* it every job, which is the same transfer constraint that makes
+  caching artifacts a losing trade (see CLAUDE.md).
+- **The 17 SQL sockets are the hard part.** CRIU's `--tcp-established` needs
+  the peer alive with matching sequence numbers; restoring against a fresh
+  SQL container leaves all 17 dead. Either checkpoint SQL too (multi-GB, and
+  its data is on a 4 GB tmpfs) or rely on SqlClient invalidating and
+  reopening pooled connections — which will appear to work and then fail
+  under load, looking like a flaky test rather than a broken restore.
+- **The DB snapshot is a prerequisite, not an alternative.** A restored
+  process image is only coherent against the exact database state it was
+  checkpointed with. The post-publish snapshot provides that deterministically.
+
+Not attempted here: this session ran on a Firecracker microVM whose kernel has
+`# CONFIG_CHECKPOINT_RESTORE is not set`, so CRIU cannot run at any privilege
+level and `docker checkpoint` (which sits on CRIU) is unavailable with it.
+Stock Ubuntu hosts have the option enabled and `criu` in universe.
+
+The decisive probe, in order — if step 4 fails, stop, the design is dead:
+
+1. Host with `CONFIG_CHECKPOINT_RESTORE=y`; `apt-get install criu`;
+   `criu check --all`.
+2. `dockerd` with `{"experimental": true}` in `/etc/docker/daemon.json`.
+3. Boot to healthy with the DB snapshot + warm assembly cache.
+4. `docker checkpoint create --leave-running=false <bc-container> cp1`, then
+   `docker start --checkpoint cp1 <bc-container>`.
+5. Pass/fail: does `GET /BC/ODataV4/Company` return 200, and does a *novel*
+   app still publish through the dev endpoint? Anything less is not a pass —
+   Patch #30 above looked fine on a boot check and was catastrophic.
+
 ## 2. XLIFF translation parsing — ~10s CPU, plus an ~11s serializer-generation stall
 
 Top CPU frame across all threads is

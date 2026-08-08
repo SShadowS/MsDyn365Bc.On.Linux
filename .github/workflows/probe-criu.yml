@@ -67,7 +67,17 @@ concurrency:
 
 jobs:
   probe:
-    runs-on: ubuntu-latest
+    # The blocker in runs 5 and 6 was the KERNEL (criu could not parse the vDSO
+    # on 6.17-azure), and the only way to choose a kernel on hosted runners is
+    # the runner label. ubuntu-22.04 is older AND ships criu in universe, so it
+    # tests a different criu against a different kernel. fail-fast off: each leg
+    # is an independent answer, and the gate now fails in ~3 min when criu
+    # cannot initialise.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
       # `inputs.*` is empty when this runs from the push trigger, so each one
@@ -125,9 +135,14 @@ jobs:
               libgnutls28-dev libnftables-dev iproute2 asciidoc xmlto
             REF="$CRIU_REF"
             if [ "$REF" = "latest" ]; then
-              REF=$(curl -fsSL https://api.github.com/repos/checkpoint-restore/criu/releases/latest \
-                    | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo v4.0)
-              echo "resolved newest criu release: $REF"
+              # criu publishes TAGS, not GitHub Releases -- /releases/latest 404s.
+              # Run 6 silently fell back to v4.0 and repeated a known failure, so
+              # an unresolvable tag is now fatal rather than a quiet downgrade.
+              REF=$(curl -fsSL "https://api.github.com/repos/checkpoint-restore/criu/tags?per_page=100" \
+                    | grep -oP '"name":\s*"\Kv?[0-9]+\.[0-9]+(\.[0-9]+)?(?=")' \
+                    | sort -V | tail -1)
+              [ -n "$REF" ] || { echo "::error::could not resolve a criu tag"; exit 1; }
+              echo "resolved newest criu tag: $REF (from tags API, not releases)"
             fi
             git clone --depth 1 --branch "$REF" https://github.com/checkpoint-restore/criu.git /tmp/criu
             make -C /tmp/criu -j"$(nproc)" 2>&1 | tail -15

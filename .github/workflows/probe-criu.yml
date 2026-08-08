@@ -278,7 +278,12 @@ jobs:
           #   ghost-limit      raises the 1 MB cap on deleted-but-open file data
           # This answers "can it dump at all", not "what is the minimal set" --
           # trim later if that matters.
-          printf 'tcp-established\ntcp-close\nfile-locks\next-unix-sk\nlink-remap\nghost-limit 512M\n' \
+          # Run 12 found NO criu log anywhere: containerd tears the restore task
+          # dir down on failure, taking criu-restore.log with it before any find
+          # can run. criu takes work-dir/log-file from this same config, so point
+          # it somewhere that outlives the container.
+          sudo mkdir -p /tmp/criu-work && sudo chmod 777 /tmp/criu-work
+          printf 'tcp-established\ntcp-close\nfile-locks\next-unix-sk\nlink-remap\nghost-limit 512M\nwork-dir /tmp/criu-work\nlog-file criu.log\n' \
             | sudo tee /etc/criu/runc.conf
           echo "criu on PATH: $(command -v criu || echo NONE)"
           echo "dockerd sees: $(sudo docker info 2>/dev/null | grep -iE 'runtime|storage driver' | tr '\n' ' ')"
@@ -350,6 +355,10 @@ jobs:
             # Run 11: the assumed path was empty. After --leave-running=false the
             # container is exited, so containerd's task dir is gone or transient.
             # Search instead of assuming -- any criu log touched in the last 5 min.
+            echo "--- criu work-dir log (survives the task dir teardown) ---"
+            sudo grep -E "Error \(|Warn \(" /tmp/criu-work/criu.log 2>/dev/null | tail -20 \
+              || sudo tail -30 /tmp/criu-work/criu.log 2>/dev/null || echo "(no /tmp/criu-work/criu.log)"
+            sudo cp /tmp/criu-work/criu.log ./criu-restore.log 2>/dev/null || true
             echo "--- searching for criu restore logs ---"
             sudo find /run/containerd /var/lib/docker /var/log /tmp -name 'criu*.log' -mmin -5 2>/dev/null | tee found-logs.txt
             while read -r f; do

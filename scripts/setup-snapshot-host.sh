@@ -128,9 +128,10 @@ if command -v criu >/dev/null; then
     echo "$CRIU_CHECK_OUT" | grep -E '^(Error|Warn)' | tail -8 | sed 's/^/        /'
     echo "        (full output: sudo criu check)"
     if echo "$CRIU_CHECK_OUT" | grep -qiE 'vdso|kerndat_vdso'; then
-      echo "        This looks like the vDSO-parsing failure criu hits on very new"
-      echo "        kernels. Options: build criu from git master (the fix may have"
-      echo "        landed since 4.2.1), or run on an LTS kernel."
+      echo "        This is the vDSO-parsing failure. It is NOT about kernel age --"
+      echo "        criu 4.2.1 checks clean on Arch 7.1.4 and fails on 6.17-azure --"
+      echo "        so it tracks the kernel flavour. Try criu from git master, or a"
+      echo "        different kernel build."
     fi
     NEED=1
   fi

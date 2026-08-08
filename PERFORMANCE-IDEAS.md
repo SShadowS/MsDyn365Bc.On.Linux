@@ -264,7 +264,7 @@ Sixteen runs to get here. Each barrier and its fix, so none is re-derived:
 
 | barrier | run | fix |
 |---|---|---|
-| kernel cannot run criu at all (vDSO symtable) | 5-6 | `ubuntu-22.04`, **not** `ubuntu-latest` (kernel 6.17) |
+| kernel cannot run criu at all (vDSO symtable) | 5-6 | `ubuntu-22.04`, **not** `ubuntu-latest`. NOT a "new kernel" problem — see below |
 | `Connected TCP socket` (the SQL pool) | 7 | `tcp-established` in `/etc/criu/runc.conf` |
 | `Some file locks are hold by dumping tasks` | 8 | `file-locks` |
 | restore: `bind-mount /proc/0/ns/net … no such file` | 9 | `network_mode: host` — docker cannot rebuild a bridge netns whose init pid does not exist yet |

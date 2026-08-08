@@ -103,9 +103,20 @@ jobs:
           command -v btrfs >/dev/null && sudo -n btrfs filesystem df / 2>/dev/null \
             || btrfs filesystem df / 2>/dev/null || echo "  (needs root or not btrfs)"
           df -Phi / 2>/dev/null | sed 's/^/  /'
-          echo "--- containerd checkpoint staging left in tmp ---"
-          ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l
-          du -sh /tmp/ctrd-checkpoint* 2>/dev/null | tail -5 || true
+          # THE HOST'S /tmp, not this job's. runc and containerd run as the host
+          # daemon, so the ENOSPC and the ctrd-checkpoint dirs are on the host's
+          # filesystem -- which is not necessarily the one this job sees. Every
+          # -v source path is resolved by the daemon, so a container gives the
+          # host's view. Run 12's df compared the wrong /tmp and I wrongly
+          # concluded the ramdisk theory was dead.
+          echo "--- host /tmp as the docker daemon sees it ---"
+          docker run --rm -v /tmp:/t:ro busybox sh -c \
+            'df -Ph /t; echo "ctrd staging: $(ls -d /t/ctrd-checkpoint* 2>/dev/null | wc -l) dirs"; du -sh /t 2>/dev/null' \
+            2>/dev/null || echo "  (could not inspect host /tmp)"
+          echo "--- host /var/tmp as the docker daemon sees it ---"
+          docker run --rm -v /var/tmp:/t:ro busybox df -Ph /t 2>/dev/null || true
+          echo "--- this job's own view, for comparison ---"
+          df -Ph /tmp /var/tmp 2>/dev/null || true
           echo "dangling images: $(docker images -f dangling=true -q | wc -l)"
           docker system df 2>/dev/null | head -5
 

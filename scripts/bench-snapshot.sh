@@ -66,6 +66,12 @@ wait_odata() {
 cold_boot()    { docker compose down -v --remove-orphans; docker compose up -d; }
 warm_boot()    { docker compose down --remove-orphans;    docker compose up -d; }
 snap_restore() { docker compose down --remove-orphans;    ./scripts/snapshot.sh restore; }
+# Removes ONLY bc, so the sql container — and with it the database snapshot,
+# which lives in a tmpfs and dies with the container — survives into the next
+# restore. That is the difference between reverting the database and rebuilding
+# it from a 539 MB backup, and it is the shape a self-hosted runner can
+# actually have: one long-lived sql, a bc replaced per job.
+snap_restore_warmsql() { docker compose rm -sf bc >/dev/null 2>&1; ./scripts/snapshot.sh restore; }
 
 # ── environment: these numbers are only comparable within one machine ─────────
 say "machine"
@@ -137,6 +143,9 @@ fi
 # production default (discard) stays untouched.
 export BC_SNAPSHOT_KEEP_ON_FAIL=1
 run_rung "restore (snapshot mode)" snap_restore
+# Ordered second on purpose: it depends on the sql container left running by
+# the rung above, and it is the configuration a self-hosted runner would use.
+run_rung "restore (snapshot mode, sql kept)" snap_restore_warmsql
 
 say "results — seconds to OData 200"
 python3 scripts/bench-report.py "$RESULTS"

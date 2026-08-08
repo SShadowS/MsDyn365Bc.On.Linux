@@ -366,6 +366,71 @@ _import_checkpoint() {  # <store-checkpoint-dir> <container-id>
 # A silently-failed RESTORE would have been far worse than a noisy one.
 _sqlcmd() { docker compose exec -T sql /opt/mssql-tools18/bin/sqlcmd -b -S localhost -U sa -P "${SA_PASSWORD:-Passw0rd123!}" -C -No "$@"; }
 
+# ─── reverting the database instead of rebuilding it ──────────────────────────
+#
+# A fresh database every run is a CORRECTNESS requirement: a sql container that
+# simply keeps its database carries the previous run's mutations, and the
+# checkpoint's frozen BC would no longer correspond to what is on disk.
+#
+# A SQL Server database snapshot satisfies that requirement more exactly than
+# the backup does. `RESTORE DATABASE ... FROM DATABASE_SNAPSHOT` reverts to the
+# very pages that existed when it was taken -- taken here immediately after the
+# checkpoint, so it is the state the frozen process expects -- and it costs
+# time proportional to what changed, not to the size of the database.
+#
+# It is an ADDITION, never a replacement. The sparse file lives in the sql data
+# dir, which is a tmpfs, so it dies with the container; CI's fresh container per
+# job keeps the backup path, and so does the first restore after any reboot.
+# Developer edition supports snapshots and is what this compose file gets by not
+# setting MSSQL_PID; Express does not, which is why every failure here is soft.
+DB_SNAP=CRONUS_bcsnap
+
+_create_db_snapshot() {
+  # One entry per DATA file (log files are excluded from snapshots). Building
+  # the list in T-SQL keeps it correct if the demo database ever gains a file.
+  local out
+  if ! out=$(_sqlcmd -h -1 -W -Q "
+    SET NOCOUNT ON;
+    IF DB_ID('$DB_SNAP') IS NOT NULL DROP DATABASE [$DB_SNAP];
+    DECLARE @f nvarchar(max) = STUFF((
+      SELECT ', (NAME = [' + name + '], FILENAME = ''/var/opt/mssql/data/' + name + '_bcsnap.ss'')'
+      FROM sys.database_files WHERE type_desc = 'ROWS' FOR XML PATH('')), 1, 2, '');
+    EXEC('CREATE DATABASE [$DB_SNAP] ON ' + @f + ' AS SNAPSHOT OF [CRONUS]');" 2>&1); then
+    log "  (no database snapshot: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-140))"
+    log "  restores will rebuild from the backup — correct, just slower"
+    return 0
+  fi
+  log "  database snapshot $DB_SNAP created (restores can revert instead of rebuild)"
+}
+
+# Non-zero means "no usable snapshot, do it the long way" — never fatal.
+_revert_db_snapshot() {
+  [ "${BC_SNAPSHOT_DB_REVERT:-1}" = "1" ] || return 1
+  # Both must exist: the snapshot alone is meaningless if CRONUS was dropped,
+  # and a container recreated since `create` has neither.
+  _sqlcmd -h -1 -W -Q "SET NOCOUNT ON; SELECT CASE WHEN DB_ID('$DB_SNAP') IS NOT NULL
+    AND DB_ID('CRONUS') IS NOT NULL THEN 1 ELSE 0 END" 2>/dev/null | grep -q '^1' || return 1
+  local out
+  # SINGLE_USER first: reverting needs exclusive access, and BC is stopped at
+  # this point but its sessions may not have drained. MULTI_USER is restored on
+  # both paths, or the database would be left unusable by the restored NST.
+  if ! out=$(_sqlcmd -Q "
+    ALTER DATABASE [CRONUS] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    BEGIN TRY
+      RESTORE DATABASE [CRONUS] FROM DATABASE_SNAPSHOT = '$DB_SNAP';
+    END TRY
+    BEGIN CATCH
+      ALTER DATABASE [CRONUS] SET MULTI_USER;
+      THROW;
+    END CATCH;
+    ALTER DATABASE [CRONUS] SET MULTI_USER;" 2>&1); then
+    log "  database revert failed, rebuilding from the backup instead:"
+    printf '%s\n' "$out" | tail -4 >&2
+    return 1
+  fi
+  return 0
+}
+
 # The bind-mount source docker creates for /sqlsnap is owned by root and mode
 # 755, and SQL Server runs as uid 10001 — so BACKUP TO DISK lands on EACCES
 # unless the directory is prepared first. Same reasoning as the chmod 644 on the
@@ -707,6 +772,7 @@ create() {
   # writes the backup as uid 10001 mode 640, which the runner user cannot read.
   docker compose exec -T sql cat /sqlsnap/cronus.bak > "$s/cronus.bak"
   [ -s "$s/cronus.bak" ] || die "database backup came out empty"
+  _create_db_snapshot
 
   # Written last: the stamp is what makes the pair readable, so it must not
   # exist until both halves are on disk. A torn snapshot is a miss, not a
@@ -780,8 +846,10 @@ restore() {
   # gone, and reconnects on first use — but only if there is something to
   # reconnect TO, with the database it expects.
   _prepare_sqldir
-  cp "$s/cronus.bak" "${BC_SNAPSHOT_SQLDIR:-/var/tmp/bc-sqlstage}/cronus.bak"
-  chmod 644 "${BC_SNAPSHOT_SQLDIR:-/var/tmp/bc-sqlstage}/cronus.bak"
+  # The 539 MB backup is NOT staged here any more: on the revert path it is
+  # never read, and copying it first made every fast restore pay for the slow
+  # one. It moves into the fallback branch below, which is the only place that
+  # touches it.
   docker compose up -d sql
   local i
   for i in $(seq 1 90); do
@@ -795,8 +863,19 @@ restore() {
   # trip; the RESTORE is the only part a SQL Server database snapshot could
   # replace, and only when the container persists (the data dir is a tmpfs, so
   # a snapshot dies with it).
-  local t_sqlup; t_sqlup=$(date +%s)
+  local t_sqlup t_db; t_sqlup=$(date +%s)
   log "  sql container up and healthy in $(( t_sqlup - t0 ))s"
+
+  # FAST PATH: the container survived since `create`, so the database can be
+  # reverted to the exact pages the frozen BC expects instead of rebuilt from a
+  # 539 MB backup. Reverting keeps the login too, which is why that whole block
+  # is skipped. Falls through to the long way whenever anything is missing.
+  if _revert_db_snapshot; then
+    log "database reverted to the snapshot ($(( $(date +%s) - t_sqlup ))s; sql up + revert: $(( $(date +%s) - t0 ))s)"
+    t_db=$(date +%s)
+  else
+  cp "$s/cronus.bak" "${BC_SNAPSHOT_SQLDIR:-/var/tmp/bc-sqlstage}/cronus.bak"
+  chmod 644 "${BC_SNAPSHOT_SQLDIR:-/var/tmp/bc-sqlstage}/cronus.bak"
 
   # master went with the previous container (the data dir is a tmpfs), so the
   # BC login has to be recreated exactly as entrypoint.sh Step 3 makes it.
@@ -827,7 +906,14 @@ restore() {
     return 1
   fi
   log "database restored (sql up + login + restore: $(( $(date +%s) - t0 ))s; restore alone $(( $(date +%s) - t_sqlup ))s)"
-  local t_db; t_db=$(date +%s)
+  # Arm the fast path for NEXT time. This container is fresh, so it inherited no
+  # snapshot; taking one now costs about a second (a sparse file) and means a
+  # later restore against this same container reverts instead of rebuilding.
+  # Self-healing rather than order-dependent: the first restore after any
+  # container recreation is slow, every one after it is fast.
+  _create_db_snapshot
+  t_db=$(date +%s)
+  fi
 
   # The container has to exist with the same configuration before its process
   # image can be restored into it, and it must not be STARTED — starting it

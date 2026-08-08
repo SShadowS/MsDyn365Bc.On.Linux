@@ -59,6 +59,38 @@ BC 28.0):
 | **NST startup** | **31s** |
 | **post-NST publish** | **24s** |
 
+## Taken
+
+### Booting sql and bc in parallel (2026-08-08)
+
+`bc` gated on `sql`'s healthcheck (`condition: service_healthy`), so its
+container sat in `Created` until SQL answered `SELECT 1`. Measured **5.8s** of
+dead time on every boot, and most of that is polling rather than SQL: the
+healthcheck's `interval` is 5s, so the earliest observable "healthy" is ~5s even
+when SQL is ready at 2s.
+
+The gate was redundant. `entrypoint.sh` Step 3 has always blocked on
+`until sqlcmd … SELECT 1`, so BC already waits for SQL itself. Changed to
+`condition: service_started`, which keeps the dependency graph — `docker compose
+up bc` still brings sql up — without waiting on the health probe.
+
+**What this does NOT do is overlap NST with SQL's startup.** NST is not started
+until Step 3 has restored the demo database, created the login, imported the
+license and run the app filter. It is gated on a restored *database*, not on a
+reachable server. What overlaps is the entrypoint's pre-SQL work: the artifact
+copy and the service-tier patching. So the ceiling is the gate itself, ~5-6s,
+whatever else changes.
+
+Below the 10s noise floor stated above — but that floor is for whole matrix
+jobs. The snapshot test's cold-boot figure has landed within ~1s across six
+consecutive runs (137/137/137/137/135/135), which is tight enough to see this.
+
+The entrypoint's SQL wait was unbounded and is now capped
+(`BC_SQL_WAIT_TIMEOUT`, default 600s). That is not optional with the gate gone:
+compose used to fail fast and clearly when SQL was unhealthy, and without a cap
+"sql never came up" would surface half an hour later as "bc never became
+healthy", pointing nowhere near the cause.
+
 ## Dead ends
 
 ### Starting SQL during the artifact download

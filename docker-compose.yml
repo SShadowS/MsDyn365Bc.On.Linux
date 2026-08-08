@@ -70,7 +70,24 @@ services:
     stdin_open: true
     depends_on:
       sql:
-        condition: service_healthy
+        # service_started, NOT service_healthy: the two containers boot in
+        # parallel and bc waits for SQL itself.
+        #
+        # The entrypoint already blocks on `until sqlcmd ... SELECT 1`, so the
+        # compose-level health gate was doing the same job a second time — and
+        # doing it worse, because the healthcheck's 5s interval means the
+        # earliest observable "healthy" is ~5s even when SQL is ready at 2s.
+        # Measured 5.8s of dead time on every boot.
+        #
+        # What this buys is bounded by the gate, not by SQL: NST does not start
+        # until Step 3 has restored the database, so it can never overlap SQL's
+        # startup. What overlaps is the entrypoint's pre-SQL work — the artifact
+        # copy and the service-tier patching. ~5-6s, which is below the noise
+        # floor of a single A/B (CI-STEP-ORDERING.md) but deterministic.
+        #
+        # service_started rather than dropping depends_on entirely so the
+        # dependency graph survives: `docker compose up bc` still brings sql up.
+        condition: service_started
     ports:
       - "${BC_DEV_PORT:-7049}:7049"
       - "${BC_ODATA_PORT:-7048}:7048"

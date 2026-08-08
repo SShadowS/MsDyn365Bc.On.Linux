@@ -530,10 +530,20 @@ log_step "Step 2b (patched assemblies): $(($(date +%s) - STEP2B_START))s"
 export PATH="$PATH:/opt/mssql-tools18/bin"
 
 log_step "Waiting for SQL Server..."
+# Bounded. This loop is now the ONLY thing waiting for SQL — docker-compose.yml
+# gates bc on service_started so the two boot in parallel — and an unbounded
+# wait would turn "sql never came up" into "bc was unhealthy 30 minutes later",
+# pointing nowhere near the cause. Generous enough for a loaded runner.
+SQL_WAIT_DEADLINE=$(( $(date +%s) + ${BC_SQL_WAIT_TIMEOUT:-600} ))
 until sqlcmd -S "$SQL_SERVER" -U sa -P "$SA_PASSWORD" -C -No -Q "SELECT 1" &>/dev/null; do
+    if [ "$(date +%s)" -ge "$SQL_WAIT_DEADLINE" ]; then
+        log_step "ERROR: SQL Server at '$SQL_SERVER' did not accept connections within ${BC_SQL_WAIT_TIMEOUT:-600}s."
+        log_step "       Check the sql container: docker compose logs sql"
+        exit 1
+    fi
     sleep 2
 done
-log_step "SQL Server ready."
+log_step "SQL Server ready after $(( $(date +%s) - ENTRYPOINT_START ))s of container uptime."
 STEP3_START=$(date +%s)
 
 SQLCMD="sqlcmd -S $SQL_SERVER -U sa -P $SA_PASSWORD -C -No"

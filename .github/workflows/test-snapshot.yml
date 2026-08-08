@@ -28,6 +28,11 @@ on:
       - '.github/workflows/test-snapshot.yml'
       - 'scripts/snapshot.sh'
       - 'docker-compose.snapshot.yml'
+      # Both affect the cold boot this test times, and that number has been
+      # stable to within ~1.5s across ten runs — tight enough to see a 5s
+      # ordering change, which the matrix-wide 10s noise floor is not.
+      - 'docker-compose.yml'
+      - 'scripts/entrypoint.sh'
   workflow_dispatch:
     inputs:
       bc_version:

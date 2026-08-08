@@ -341,6 +341,13 @@ _host_tmp_stat() {  # prints "<fstype> <free_mb>"
     'printf "%s %s\n" "$(stat -f -c %T /t)" "$(df -Pm /t | awk "NR==2{print \$4}")"' 2>/dev/null
 }
 
+# Root-owned like everything else criu writes, so it goes through the socket.
+_root_read_dir_count() {  # <dir> -> "N files, S total, pages-*: P"
+  docker run --rm -v "$1":/c:ro --entrypoint sh "$(_bc_image_ref)" -c \
+    'printf "%s files, %s total, %s pages-*.img\n" "$(ls /c | wc -l)" "$(du -sh /c | cut -f1)" "$(ls /c/pages-*.img 2>/dev/null | wc -l)"' \
+    2>/dev/null || echo "unreadable"
+}
+
 _export_checkpoint() {  # <container-id> <dest-dir>   result is owned by us
   docker run --rm -v "$(_ckpt_path "$1")":/src:ro -v "$2":/dst \
     --entrypoint sh "$(_bc_image_ref)" -c \
@@ -592,6 +599,18 @@ create() {
   # it back. Without this a backup error leaves the caller with no BC at all and
   # a half-written snapshot that would be picked up as a hit next run.
   trap _create_failed EXIT
+  # criu restore time scales with the NUMBER OF MAPPINGS, not with the size of
+  # the checkpoint: 2.1 GB of pages is a second or two of NVMe, yet the restore
+  # takes 27s. This NST is an extreme case -- it needs vm.max_map_count >= 2^20
+  # and carries a ~263 GB VmSize, nearly all of it Server GC reservations -- so
+  # this one number decides whether reducing those reservations
+  # (DOTNET_GCHeapCount, DOTNET_gcServer=0) could recover most of the restore,
+  # or whether they are a handful of large mappings and would recover nothing.
+  # Measured, not assumed, because the trade is real: gcServer=1 is there for
+  # the parallel Roslyn compile during startup.
+  log "  nst mappings: $(docker compose exec -T bc sh -c \
+    'p=$(pgrep -n dotnet 2>/dev/null); [ -n "$p" ] && printf "%s vmas, %s" "$(wc -l < /proc/$p/maps)" "$(awk "/VmSize/{print \$2\" \"\$3}" /proc/$p/status)"' \
+    2>/dev/null || echo unknown)"
   t0=$(date +%s)
   # --leave-running=false: the process must really stop, otherwise the backup
   # below races a BC that is still writing and the two halves disagree.
@@ -636,6 +655,9 @@ create() {
   [ "$(docker inspect --format '{{.State.Status}}' "$cid")" = "exited" ] \
     || die "bc still running after checkpoint — nothing was captured"
   log "checkpoint written in $(( $(date +%s) - t0 ))s"
+  # The image count is the other half of the picture: criu writes one pages-*.img
+  # per memory region set, and restore walks all of them.
+  log "  checkpoint: $(_root_read_dir_count "$(_ckpt_path "$cid")/cp1")"
   # Reap before the copy, so the peak is one staged copy rather than two.
   _reap_ctrd_staging
   # Copied rather than written in place; see _ckpt_path above for why. The

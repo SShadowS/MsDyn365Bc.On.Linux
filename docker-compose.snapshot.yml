@@ -1,0 +1,38 @@
+# Overlay required by snapshot mode (scripts/snapshot.sh). Opt-in:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.snapshot.yml up -d
+#
+# Nothing here is a preference. Both changes are things checkpoint/restore
+# cannot work without, and snapshot.sh's preflight refuses to run without them.
+services:
+  sql:
+    volumes:
+      # RESTORE FROM DISK reads SQL Server's OWN filesystem, so the backup has
+      # to sit somewhere that outlives the sql container — the same constraint
+      # that makes the license import mount /bc/artifacts on both services (see
+      # CLAUDE.md, "CRITICAL: the mount must be on BOTH the bc AND sql
+      # services"). The sql data dir itself is a tmpfs, so the container being
+      # replaced is exactly the case this has to survive.
+      - ${BC_SNAPSHOT_SQLDIR:-/tmp/sqlsnap}:/sqlsnap
+
+  bc:
+    # Docker restores a container by bind-mounting /proc/<init-pid>/ns/net to
+    # re-attach its network sandbox. On restore the init process does not exist
+    # yet, so the pid is 0 and it fails with:
+    #
+    #   bind-mount /proc/0/ns/net -> /var/run/docker/netns/…: no such file
+    #
+    # A container on the default bridge — which is what compose creates — cannot
+    # be restored at all. Host networking removes the namespace, so there is
+    # nothing to rebuild. The cost is that published ports become host ports
+    # directly: BC listens on 7045-7089 and 8080 on the host, and the port
+    # variables in docker-compose.yml stop having any effect, so two instances
+    # on one machine need separate hosts or separate network namespaces.
+    network_mode: host
+    environment:
+      # Bridge DNS is gone with host networking, so "sql" no longer resolves.
+      # sql stays on the bridge and publishes ${SQL_PORT:-11433}, so the port
+      # has to be named explicitly — "host,port" is what both sqlcmd and BC's
+      # DatabaseServer setting expect. Writing it this way means snapshot mode
+      # does not also require the caller to move SQL_PORT to 1433.
+      SQL_SERVER: localhost,${SQL_PORT:-11433}

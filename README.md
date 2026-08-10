@@ -488,6 +488,43 @@ BC_CLIENT_PORT=17085
 docker compose -p bc280 --env-file .env.bc280 up -d --wait
 ```
 
+### …and the same thing in CI
+
+The constraint above — one project name and one port set per BC — is what
+makes two CI jobs on one machine dangerous rather than merely slow. Compose
+derives the project name from the working directory's basename, which is
+`bc-linux` in every pipeline, so two jobs on one docker host address the same
+`bc-linux-bc-1` and `bc-linux-sql-1`. The second job's
+`docker compose down --remove-orphans` deletes the first job's BC in the
+middle of its test run, and both die with GitHub's generic "the runner has
+received a shutdown signal" — which points nowhere near the cause
+([issue #24](https://github.com/StefanMaron/MsDyn365Bc.On.Linux/issues/24)).
+
+Every pipeline in this repo therefore takes a machine-wide lease
+(`scripts/ci-lock.sh`) around the container lifecycle, so jobs sharing a
+machine queue instead of destroying each other. On a GitHub-hosted runner the
+lease is uncontended and costs a single file create.
+
+Queueing is the safe default, not the fast one. To actually run two BCs at
+once on one self-hosted machine, give each caller its own slot:
+
+```yaml
+jobs:
+  bc-tests:
+    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    with:
+      instance_slot: 1     # project bc-linux-1; every port +100
+```
+
+Slot N gets the compose project `bc-linux-N` and every published port offset
+by N\*100 (slot 1: dev 7149, OData 7148, API 7152, SQL 11533, …).
+Jobs on different slots run concurrently; jobs on the same slot still queue.
+Budget a full BC service tier plus a SQL Server in RAM per slot.
+
+`ci-lock.sh` is usable on its own, too — `acquire`/`release`/`status`, with
+`BC_CI_LOCK_DIR` pointing at a path shared by everything that shares the
+docker daemon.
+
 ---
 
 ## How it works

@@ -33,6 +33,20 @@ jobs:
       #   "50000,50001,50002"             explicit ids
       codeunit_range: "50000..99999"
 
+      # ─── Optional: more than one BC per self-hosted machine ─────────
+      # Every job that runs BC — yours and everyone else's on the same
+      # docker host — drives the same compose project (`bc-linux`) and the
+      # same host ports, so one job's `docker compose down` deletes
+      # another's BC mid-test. The reusable workflow takes a machine-wide
+      # lease to stop that, which means jobs sharing a machine QUEUE.
+      #
+      # Nothing to do here if that's fine, and nothing to do at all on a
+      # GitHub-hosted runner. To run two BCs side by side on one big
+      # self-hosted machine, give each caller its own slot — slot N moves
+      # the compose project to `bc-linux-N` and every port by N*100:
+      #
+      # instance_slot: 1
+
       # ─── Optional: analyzers + rulesets ─────────────────────────────
       # All off by default. Uncomment to enable. The reusable workflow
       # fails the job if any analyzer DLL fails to load (AD0001,

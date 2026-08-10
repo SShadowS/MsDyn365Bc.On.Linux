@@ -209,6 +209,31 @@ steps:
       BC_LICENSE_B64: $(BC_LICENSE_B64)
     displayName: 'Stage ISV license (if BC_LICENSE_B64 is set)'
 
+  # Compose names its project after the working directory's basename —
+  # `bc-linux` here and in every other pipeline — and docker-compose.yml binds
+  # fixed host ports. Two jobs on one docker host therefore drive the SAME
+  # containers, and the second one's `docker compose down` in the next step
+  # deletes the first one's BC mid-test (issue #24). ci-lock.sh serializes them
+  # on a machine-wide lease.
+  #
+  # On a Microsoft-hosted agent this is a no-op — the VM belongs to this job.
+  # It earns its place the moment you move to a self-hosted agent, which is
+  # also when the artifact cache and the warm service-tier volume start paying
+  # off.
+  #
+  # The token has to reach the release step at the bottom of the job, and an
+  # `export` does not survive a step boundary here — hence the setvariable.
+  - bash: |
+      set -e
+      cd "$(Agent.BuildDirectory)/bc-linux"
+      bash scripts/ci-lock.sh acquire bc-linux \
+        --wait-minutes 35 --max-hold-minutes 45 | tee /tmp/ci-lock-acquire.log
+      rc=${PIPESTATUS[0]}
+      [ "$rc" -eq 0 ] || exit "$rc"
+      TOKEN=$(sed -n 's/^BC_CI_LOCK_TOKEN=//p' /tmp/ci-lock-acquire.log)
+      echo "##vso[task.setvariable variable=BC_CI_LOCK_TOKEN]$TOKEN"
+    displayName: 'Reserve the BC container stack on this machine'
+
   - bash: |
       set -e
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" begin BC_BOOT "BC startup (background → wait for healthy)"
@@ -224,7 +249,7 @@ steps:
       # is provided as a secret variable). Empty/unset = default Cronus.
       export BC_LICENSE_HOST_PATH="${BC_LICENSE_HOST_PATH:-}"
       export BC_LICENSE_FILE="${BC_LICENSE_FILE:-}"
-      # Clear any leftover compose state before starting. On a GitHub-hosted
+      # Clear any leftover compose state before starting. On a Microsoft-hosted
       # runner this is a no-op (fresh VM, nothing to remove). On a self-hosted
       # one the previous job's bc/sql containers may still be running, and
       # `docker compose up -d` adopts a running container instead of recreating
@@ -601,3 +626,18 @@ steps:
       docker compose logs bc | tail -200
     displayName: 'BC logs (on failure)'
     condition: failed()
+
+  # Last step, and after the log dump — the containers have to still be ours
+  # while that runs. No `docker compose down`: the next job does its own, and
+  # leaving the stack up is what keeps a self-hosted agent's warm-volume path
+  # warm.
+  #
+  # If the acquire step never ran, Azure leaves the macro unexpanded and the
+  # token will not match the lease — release then refuses rather than handing
+  # a running job's stack to somebody else, and the lease is reclaimed on its
+  # own once the heartbeat stops.
+  - bash: |
+      export BC_CI_LOCK_TOKEN="$(BC_CI_LOCK_TOKEN)"
+      bash "$(Agent.BuildDirectory)/bc-linux/scripts/ci-lock.sh" release bc-linux
+    displayName: 'Release the BC container stack'
+    condition: always()

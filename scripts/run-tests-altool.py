@@ -957,6 +957,10 @@ def main() -> int:
     ap.add_argument("--server-instance", default="BC", help="NST instance name (default BC)")
     ap.add_argument("--port", type=int, default=7049, help="dev endpoint port (default 7049)")
     ap.add_argument("--base-url", default="http://localhost:7048/BC", help="OData base URL for company auto-detect")
+    ap.add_argument("--api-port", type=int, default=7052,
+                    help="API port used for the company auto-detect fallback (default 7052). "
+                         "Only differs from the default when the caller has moved BC's published "
+                         "ports — see the reusable workflows' instance_slot input.")
     ap.add_argument("--timeout", type=int, default=30, help="overall timeout, minutes (default 30)")
     ap.add_argument("--codeunit-timeout", type=int, default=10, help="per-codeunit timeout, minutes (default 10)")
     ap.add_argument("--altool-cmd", default="al", help="AL dotnet tool command or path (default 'al')")
@@ -1020,7 +1024,7 @@ def main() -> int:
         origin = re.sub(r"(https?://[^:/]+).*", r"\1", args.base_url)
         detect_start = time.monotonic()
         company = detect_company(
-            [args.base_url, f"{origin}:7052/BC"], user, password
+            [args.base_url, f"{origin}:{args.api_port}/BC"], user, password
         )
         detect_elapsed = time.monotonic() - detect_start
         if company:

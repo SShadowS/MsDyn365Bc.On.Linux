@@ -42,6 +42,14 @@ jobs:
       - name: Check examples against the reusable workflows
         run: python3 scripts/check-example-drift.py
 
+      # ci-lock.sh runs on every pipeline in the repo and in every consumer
+      # that copied an example, and nothing else lints it — the only other
+      # shellcheck pass in CI is snapshot-scoped (test-snapshot.yml). A bug
+      # here breaks the container lifecycle for everybody, and shellcheck is
+      # free on a job that already exists and already triggers on scripts/**.
+      - name: Lint the shared lock script
+        run: shellcheck -S warning scripts/ci-lock.sh
+
       - name: Validate example YAML and shell syntax
         run: |
           set -e

@@ -166,6 +166,22 @@ jobs:
           echo "BC_LICENSE_HOST_PATH=$LICENSE_PATH" >> "$GITHUB_ENV"
           echo "BC_LICENSE_FILE=/bc/custom-license.bclicense" >> "$GITHUB_ENV"
 
+      # Compose names its project after the working directory's basename —
+      # `bc-linux` here and in every other pipeline — and docker-compose.yml
+      # binds fixed host ports. Two jobs on one docker host therefore drive the
+      # SAME containers, and the second one's `docker compose down` below
+      # deletes the first one's BC mid-test (issue #24). ci-lock.sh serializes
+      # them on a machine-wide lease.
+      #
+      # On ubuntu-latest this is a no-op — the VM belongs to this job. It earns
+      # its place the moment you point `runs-on` at a self-hosted runner. Use
+      # the reusable workflow (bc-test-prebuilt.yml) if you want more than one
+      # BC per machine; it exposes an `instance_slot` input that moves the
+      # project name and every port so jobs run concurrently instead of
+      # queueing.
+      - name: Reserve the BC container stack on this machine
+        run: bash bc-linux/scripts/ci-lock.sh acquire bc-linux --wait-minutes 35 --max-hold-minutes 45
+
       - name: Start BC on Linux (background)
         env:
           BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache/${{ env.BC_VERSION }}
@@ -267,3 +283,11 @@ jobs:
         if: failure()
         working-directory: bc-linux
         run: docker compose logs bc | tail -200
+
+      # Last step, and after the log dump — the containers have to still be
+      # ours while that runs. No `docker compose down`: the next job does its
+      # own, and leaving the stack up is what keeps a self-hosted runner's
+      # warm-volume path warm.
+      - name: Release the BC container stack
+        if: always()
+        run: bash bc-linux/scripts/ci-lock.sh release bc-linux

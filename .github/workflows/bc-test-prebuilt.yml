@@ -43,6 +43,33 @@ on:
         required: false
         type: string
         default: "ubuntu-latest"
+      instance_slot:
+        description: >
+          Which BC stack on the machine this job should use. Leave at 0 unless
+          you want two jobs running BC on ONE self-hosted machine at the same
+          time.
+
+          Background: Compose names its project after the working directory's
+          basename — `bc-linux` for every job — and docker-compose.yml binds
+          fixed host ports. So every job on a given docker host addresses the
+          same containers and the same ports, and a second job's
+          `docker compose down` deletes the first job's BC mid-test (issue
+          #24). This workflow therefore takes a machine-wide lease around the
+          container lifecycle: jobs sharing a machine queue rather than
+          destroying each other.
+
+          Raising the slot is how you buy real parallelism instead of queueing.
+          Slot N gets its own compose project (`bc-linux-N`) and its own ports,
+          offset by N*100 — slot 1 puts the dev endpoint on 7149, OData on
+          7148, SQL on 11533, and so on. Two jobs on different slots run
+          concurrently; two on the same slot still queue.
+
+          Budget roughly a full BC service tier plus a SQL Server per slot in
+          RAM before raising it. It has no effect on a GitHub-hosted runner —
+          every job there already has a machine to itself.
+        required: false
+        type: number
+        default: 0
       bc_version:
         description: "BC platform version (e.g. 27.5)"
         required: false
@@ -171,6 +198,25 @@ jobs:
       # what makes a warm cache visible to the container instead of being
       # re-downloaded into it.
       BC_ARTIFACTS_DIR: ${{ inputs.artifact_cache_dir != '' && inputs.artifact_cache_dir || format('{0}/artifact-cache', github.workspace) }}/${{ inputs.bc_version }}
+      # ─── Which container stack on this machine is ours (issue #24) ───
+      # Slot 0 keeps the historical identity exactly: project `bc-linux`, the
+      # default ports from docker-compose.yml, and therefore the same named
+      # volumes a self-hosted runner has already warmed. Raising the slot moves
+      # the whole stack — project name AND every published port — so two jobs
+      # can hold BC at once on one machine.
+      #
+      # Job-level rather than step-level for the same reason BC_ARTIFACTS_DIR
+      # is: `docker compose`, `wait-for-bc-healthy.sh` and `run-tests.sh`'s
+      # `docker compose exec` all have to agree about which project they are
+      # talking to, and they run in different steps.
+      COMPOSE_PROJECT_NAME: ${{ inputs.instance_slot == 0 && 'bc-linux' || format('bc-linux-{0}', inputs.instance_slot) }}
+      SQL_PORT: ${{ 11433 + inputs.instance_slot * 100 }}
+      BC_DEV_PORT: ${{ 7049 + inputs.instance_slot * 100 }}
+      BC_ODATA_PORT: ${{ 7048 + inputs.instance_slot * 100 }}
+      BC_API_PORT: ${{ 7052 + inputs.instance_slot * 100 }}
+      BC_MGMT_PORT: ${{ 7045 + inputs.instance_slot * 100 }}
+      BC_CLIENT_PORT: ${{ 7085 + inputs.instance_slot * 100 }}
+      BC_WEBCLIENT_PORT: ${{ 8080 + inputs.instance_slot * 100 }}
 
     steps:
       - name: Checkout your repo
@@ -272,6 +318,28 @@ jobs:
           echo "BC_LICENSE_FILE=/bc/custom-license.bclicense" >> "$GITHUB_ENV"
           echo "ISV license staged for entrypoint import"
 
+      # ─── Claim the container stack ───────────────────────────────────
+      # Everything from here to the end of the job drives containers whose
+      # names and ports are shared by every job on this docker host. Take the
+      # machine-wide lease first, so a job that arrives while this one is
+      # mid-test queues instead of running `docker compose down` on our BC.
+      #
+      # Uncontended — which is every GitHub-hosted run, since the VM is ours
+      # alone — this costs one file create. The step it protects is the next
+      # one; the release is the last step of the job.
+      #
+      # The wait budget stops short of the job timeout so the failure is OUR
+      # message ("the stack is in use by <job>") rather than GitHub's generic
+      # cancellation, which is the exact confusion issue #24 was reported for.
+      - name: Reserve the BC container stack on this machine
+        run: |
+          set -e
+          WAIT=$(( ${{ inputs.timeout_minutes }} - 10 ))
+          [ "$WAIT" -lt 5 ] && WAIT=5
+          bash bc-linux/scripts/ci-lock.sh acquire "$COMPOSE_PROJECT_NAME" \
+            --wait-minutes "$WAIT" \
+            --max-hold-minutes ${{ inputs.timeout_minutes }}
+
       # No compile in prebuilt mode, so there's nothing CPU-bound to overlap
       # with BC startup — but we still kick off in the background to allow
       # the eventual workflow-summary phase tracking to be cleaner.
@@ -301,12 +369,15 @@ jobs:
       - name: Publish .app files
         env:
           AUTH: "BCRUNNER:Admin123!"
-          DEV: "http://localhost:7049/BC/dev"
+          # Built in the shell below rather than pinned here: BC_DEV_PORT moves
+          # with instance_slot, and a step-level `env:` cannot expand another
+          # env var.
           APP_FILES: ${{ inputs.app_files }}
           TEST_APP_FILES: ${{ inputs.test_app_files }}
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin PUBLISH "Publish .app files"
+          DEV="http://localhost:${BC_DEV_PORT}/BC/dev"
           # Source the canonical publish helper. Previously this step had
           # its own inline publish_app that treated EVERY 422 as success
           # and silently swallowed missing-dependency / schema-sync errors,
@@ -365,6 +436,8 @@ jobs:
               --app "../project/$app" \
               --codeunit-range "${{ inputs.codeunit_range }}" \
               --junit-output "$junit_file" \
+              --base-url "http://localhost:${BC_ODATA_PORT}/BC" \
+              --dev-url "http://localhost:${BC_DEV_PORT}/BC/dev" \
               "${COMPANY_ARGS[@]}" \
               --timeout 30 2>&1 | tee "$tmplog"
             # `tee` always exits 0; capture run-tests.sh's real exit code.
@@ -435,3 +508,13 @@ jobs:
         if: failure()
         working-directory: bc-linux
         run: docker compose logs bc | tail -200
+
+      # Last step in the job, and after the log dump above — the containers
+      # have to still be ours while that runs. `if: always()` so a failed test
+      # run doesn't leave the next job queueing for two minutes waiting for the
+      # lease to go stale. Deliberately no `docker compose down`: the next job
+      # does its own, and leaving the stack up is what keeps the warm-volume
+      # path warm on a self-hosted runner.
+      - name: Release the BC container stack
+        if: always()
+        run: bash bc-linux/scripts/ci-lock.sh release "$COMPOSE_PROJECT_NAME"

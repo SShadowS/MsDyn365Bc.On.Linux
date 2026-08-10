@@ -107,7 +107,7 @@ Significantly hardened during the bc-copilot-blueprint bring-up session in
 selective filter, or `resolve-keep-app-ids.py` should read this whole
 section first.
 
-### The four shared scripts
+### The five shared scripts
 
 | Script | What it does | Used from |
 |---|---|---|
@@ -115,6 +115,50 @@ section first.
 | `scripts/stage-symbols.py` | Manifest-driven `.alpackages` staging. Walks an artifact tree, indexes every `.app` by id, then copies into the output dir exactly the symbols needed: System.app + Application umbrella + the consumer's transitive dependency closure. Replaces the older glob-based staging that silently missed apps when Microsoft moved files between BC versions. | `bc-test-from-source.yml`, `bc-copilot-blueprint`'s `copilot-setup-steps.yml` |
 | `scripts/publish-app.sh` | Sourceable shared helper exposing `bc_publish_app <path> [dev_url] [auth]`. Reads the response body and only treats 422 as success when it actually says "already" (catches missing-dependency / schema-sync / version-conflict failures that the previous duplicated inline `publish_app` functions silently swallowed). | `run-tests.sh`, all three workflows, `bc-copilot-blueprint`'s `iterate.sh` |
 | `scripts/wait-for-bc-healthy.sh` | Single canonical "block until docker healthcheck reports `healthy`" loop with progress lines every 60s. Replaces 4 previously-inlined copies across the workflows. | All three workflows, `iterate.sh` (could migrate, currently has its own variant) |
+| `scripts/ci-lock.sh` | Machine-wide lease around the BC/SQL container lifecycle. Heartbeat-refreshed lease file, stolen once nobody has touched it for `BC_CI_LOCK_STALE_SECONDS`. | Both reusable workflows and all four examples |
+
+### Two jobs on one machine share the containers, and that is issue #24
+
+Compose derives its project name from the working directory's basename —
+`bc-linux` for every pipeline everywhere — and `docker-compose.yml` binds
+fixed host ports. So *any* two jobs on one docker host address the same
+`bc-linux-bc-1` / `bc-linux-sql-1` and the same 7045-7089/8080/11433,
+regardless of how their workspaces are laid out. The second job's
+`docker compose down --remove-orphans` deletes the first job's BC mid-test.
+
+Two things made this expensive to find, and both are worth remembering:
+
+- **The symptom names the wrong thing.** Both jobs die with GitHub's
+  `The runner has received a shutdown signal` / `exit code 143`, which reads
+  as an infrastructure problem. Retriggering either PR alone passed with no
+  other change, which reads as flakiness. Neither points at containers.
+- **The existing `flock` looked like it covered this.** `download-artifacts.sh`
+  locks the artifact cache and `CLAUDE.md` said concurrent runners were safe —
+  true, and only about the cache. The containers were never locked.
+
+`ci-lock.sh` closes it: acquire before the `down`/`up`, release as the job's
+last step. Not flock — a CI job's steps are separate processes, so the lock has
+to outlive the step that took it. It is a lease file refreshed by a background
+heartbeat, and a lease nobody has touched for 120s is treated as abandoned.
+That last part is what makes a killed job self-heal instead of wedging the
+machine: the heartbeat is deliberately NOT `setsid`, so it dies with the job's
+process group.
+
+Two invariants if you touch it:
+
+- **Release must be the last step, after the log dump**, and must verify the
+  token before deleting. It runs `if: always()`, including on paths where
+  acquire never ran; a blind `rm` there would hand a running job's stack to
+  somebody else.
+- **Serializing is the default, not the goal.** `instance_slot: N` on either
+  reusable workflow moves the compose project to `bc-linux-N` AND every port by
+  N*100, which is what actually buys parallelism. Moving only the project name
+  would convert a silent teardown into a port bind conflict — the fixed ports
+  are half the collision.
+
+Snapshot mode is the exception: `docker-compose.snapshot.yml` needs
+`network_mode: host`, which makes the port variables inert, so slots cannot
+isolate it. Serialize it (`bench-selfhosted.yml` uses a `concurrency:` group).
 
 ### How extensions get installed for tenant
 

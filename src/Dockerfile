@@ -1,5 +1,18 @@
 # Build stage: compile StartupHook + stubs + tools
-FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/sdk:8.0 AS builder
+#
+# TARGETARCH is supplied by buildx (amd64 / arm64) and is what makes this image
+# multi-arch. It is NOT a switch to flip casually: on arm64 the NST hits
+# nondeterministic corruption under emulation and the JMP-detour layer in
+# StartupHook.cs is x86-64 machine code, so an arm64 image is only useful
+# together with the arm64 detour port. See ARM64.md / ARM64-BATTLEPLAN.md.
+#
+# The --platform pins are gone rather than parameterised: buildx already
+# defaults to the host platform, and pinning amd64 made an arm64 build
+# impossible even to attempt. `docker buildx build --platform linux/amd64`
+# reproduces the old behaviour explicitly on any host.
+ARG TARGETARCH
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS builder
+ARG TARGETARCH
 
 # gcc needed for compiling Win32 P/Invoke stubs (kernel32_stubs.c → libwin32_stubs.so);
 # unzip for extracting libSkiaSharp.so out of NuGet packages (nupkg = zip)
@@ -57,8 +70,9 @@ RUN cd tools/TestRunner && dotnet publish -c Release -o /build/output/tools/Test
 # "report rendering natives" step there. nupkgs are plain zips.
 RUN mkdir -p /build/output/skia && \
     for v in 2.88.9 3.119.0; do \
+      RID=$(case "${TARGETARCH:-amd64}" in arm64) echo linux-arm64 ;; *) echo linux-x64 ;; esac) && \
       curl -fsSL "https://www.nuget.org/api/v2/package/SkiaSharp.NativeAssets.Linux/$v" -o /tmp/skia.nupkg && \
-      unzip -j -o /tmp/skia.nupkg "runtimes/linux-x64/native/libSkiaSharp.so" -d /build/output/skia/$v && \
+      unzip -j -o /tmp/skia.nupkg "runtimes/$RID/native/libSkiaSharp.so" -d /build/output/skia/$v && \
       rm /tmp/skia.nupkg; \
     done && ls -la /build/output/skia/*
 
@@ -88,8 +102,11 @@ RUN mkdir -p /build/output/refasm /build/output/refasm-net10 && \
     cp "$REF_DIR10"/*.dll /build/output/refasm-net10/ && \
     echo "Copied $(ls /build/output/refasm/*.dll | wc -l) net8.0 + $(ls /build/output/refasm-net10/*.dll | wc -l) net10.0 reference assemblies"
 
-# Runtime stage: minimal image
-FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/aspnet:8.0
+# Runtime stage: minimal image. See the TARGETARCH note on the builder stage —
+# mcr's aspnet:8.0 is multi-arch, and mssql-tools18 / msodbcsql18 publish arm64
+# debs (verified 18.6.2.1), so this stage builds on either architecture.
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+ARG TARGETARCH
 
 # Install tools for artifact download and SQL setup + en_US locale.
 # harfbuzz/freetype/fontconfig/fonts: BC's report renderer text-shapes via native

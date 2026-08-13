@@ -510,10 +510,16 @@ except Exception:
     print('')
 PYEOF
 )
-    if [ -n "$SKIA_VER" ] && [ -f "/bc/natives/skia/$SKIA_VER/libSkiaSharp.so" ]; then
+    # harfbuzz lives under a per-architecture multiarch triplet, so resolve it
+    # rather than hardcoding one: /usr/lib/x86_64-linux-gnu on amd64,
+    # /usr/lib/aarch64-linux-gnu on arm64. ldconfig is the authority; the glob is
+    # a fallback for images with no ldconfig cache.
+    HB_LIB=$(ldconfig -p 2>/dev/null | awk '/libharfbuzz\.so\.0/ {print $NF; exit}')
+    [ -n "$HB_LIB" ] || HB_LIB=$(ls /usr/lib/*-linux-gnu/libharfbuzz.so.0 2>/dev/null | head -1)
+    if [ -n "$SKIA_VER" ] && [ -f "/bc/natives/skia/$SKIA_VER/libSkiaSharp.so" ] && [ -n "$HB_LIB" ]; then
         cp "/bc/natives/skia/$SKIA_VER/libSkiaSharp.so" "$SERVICE_DIR/libSkiaSharp.so"
-        ln -sf /usr/lib/x86_64-linux-gnu/libharfbuzz.so.0 "$SERVICE_DIR/libharfbuzz.so"
-        log_step "Report rendering natives linked (SkiaSharp $SKIA_VER + system harfbuzz)"
+        ln -sf "$HB_LIB" "$SERVICE_DIR/libharfbuzz.so"
+        log_step "Report rendering natives linked (SkiaSharp $SKIA_VER + system harfbuzz at $HB_LIB)"
     else
         log_step "WARN: no bundled libSkiaSharp.so for SkiaSharp '$SKIA_VER' — report rendering stays disabled (harfbuzz not linked either)"
     fi
@@ -1157,7 +1163,8 @@ export DOTNET_TieredCompilation="${DOTNET_TieredCompilation:-0}"
 #     --diagnostic-port /tmp/nst-diag.sock \
 #     --duration 00:02:30 --format Speedscope -o /tmp/full-cold.nettrace
 # The container must already have /tmp/dotnet-trace staged (curl from
-# https://aka.ms/dotnet-trace/linux-x64 — it's a self-contained ELF).
+# https://aka.ms/dotnet-trace/linux-x64 — it's a self-contained ELF, so the URL
+# is architecture-specific: use .../linux-arm64 on an arm64 image).
 if [ "${BC_PROFILE_NST:-0}" = "1" ]; then
     log_step "BC_PROFILE_NST=1: NST will suspend at startup until /tmp/nst-diag.sock client connects"
     rm -f /tmp/nst-diag.sock

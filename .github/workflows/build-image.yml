@@ -21,7 +21,16 @@ env:
   # silently invisible to every CI run because of this mismatch. Don't move
   # this without simultaneously updating bc-test-from-source.yml and any
   # downstream consumer.
-  IMAGE_NAME: stefanmaron/msdyn365bc.on.linux/bc-runner
+  #
+  # The OWNER half follows whoever runs the workflow, because a fork's
+  # GITHUB_TOKEN cannot write to another account's GHCR namespace: hardcoding
+  # `stefanmaron` here meant every push to a fork's master built the image
+  # successfully and then failed on push, leaving a permanently red workflow that
+  # makes real failures easy to miss. The PATH half is unchanged and must stay
+  # that way for the reason above. Set the `GHCR_OWNER` repository variable to
+  # publish somewhere other than your own namespace.
+  IMAGE_OWNER: ${{ vars.GHCR_OWNER || github.repository_owner }}
+  IMAGE_PATH: msdyn365bc.on.linux/bc-runner
 
 jobs:
   build-push:
@@ -43,6 +52,13 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
+    # GHCR rejects uppercase repository names, and github.repository_owner
+    # preserves the case the account was registered with (e.g. "SShadowS"), so it
+    # cannot be interpolated into an image ref directly.
+    - name: Resolve image name
+      id: img
+      run: echo "name=$REGISTRY/$(printf '%s' "$IMAGE_OWNER" | tr '[:upper:]' '[:lower:]')/$IMAGE_PATH" >> "$GITHUB_OUTPUT"
+
     - name: Build and push
       uses: docker/build-push-action@v6
       with:
@@ -50,11 +66,11 @@ jobs:
         file: src/Dockerfile
         push: true
         tags: |
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          ${{ steps.img.outputs.name }}:latest
+          ${{ steps.img.outputs.name }}:${{ github.sha }}
         # Registry-backed layer cache for this workflow's own rebuilds.
         # test-versions.yml's build job deliberately does NOT share it: that
         # job has to work on fork PRs, which have no registry write access,
         # so it caches to type=gha instead.
-        cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache
-        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache,mode=max
+        cache-from: type=registry,ref=${{ steps.img.outputs.name }}:cache
+        cache-to: type=registry,ref=${{ steps.img.outputs.name }}:cache,mode=max
